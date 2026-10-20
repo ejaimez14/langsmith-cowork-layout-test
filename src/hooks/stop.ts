@@ -1,0 +1,473 @@
+/**
+ * Stop hook handler.
+ *
+ * Invoked by Claude Code when the main agent finishes responding.
+ * Reads the transcript, identifies new messages since last run,
+ * groups them into turns, and sends traces to LangSmith.
+ */
+
+import { resolveTurnTracingMode } from "../tracing-mode.js";
+import {
+  readTranscript,
+  groupIntoTurns,
+  readRuntimeVersion,
+  completedToolUseIds,
+  turnToolInputs,
+} from "../transcript.js";
+import { turnScopedMetadata } from "../repo-attribution.js";
+import { log, warn, debug, error } from "../logger.js";
+import {
+  loadState,
+  atomicUpdateState,
+  getSessionState,
+  updateSessionState,
+  pruneOldSessions,
+  advanceToolTracingProgress,
+} from "../state.js";
+import { traceTurn, tracePendingSubagents, completeTurnRun } from "../langsmith.js";
+import { initHook, expandHome } from "../utils/hook-init.js";
+import { isPayloadForHook } from "../utils/harness.js";
+import { readStdin } from "../utils/stdin.js";
+import { finalizeNotificationChain } from "../finalize.js";
+import { initTracing, settledFromTurn } from "../tracing-engine.js";
+import { MUTED_TRACE_CONTENT } from "@langchain/plugins-base/privacy";
+import { queueClosing, turnClosedReset } from "../closing-queue.js";
+import { STOP_FLUSH_WAIT_MS } from "../constants.js";
+import { setTimeout as delay } from "node:timers/promises";
+import type { Config, QueuedClosing, StopHookInput, TaskRunEntry } from "../types.js";
+
+export async function main(): Promise<void> {
+  // Read hook input from stdin.
+  const input: StopHookInput = await readStdin();
+  if (!isPayloadForHook(input, "Stop")) return;
+
+  const config = initHook(input.cwd);
+  if (!config) return;
+
+  debug(`Stop hook started, session=${input.session_id}`);
+
+  // Skip recursive hook calls.
+  if (input.stop_hook_active) {
+    debug("stop_hook_active=true, skipping");
+    return;
+  }
+
+  // Validate input.
+  const transcriptPath = expandHome(input.transcript_path);
+  if (!input.session_id || !transcriptPath) {
+    warn(`Invalid input: session=${input.session_id}, transcript=${transcriptPath}`);
+    return;
+  }
+
+  await queueClosing(config, "stop", input, { reset: turnClosedReset, transcriptCut: true });
+}
+
+export async function closeStoppedTurn(
+  _id: string,
+  closing: QueuedClosing,
+  config: Config,
+): Promise<void> {
+  const input = closing.input as StopHookInput;
+  const startTime = closing.at;
+  const transcriptPath = expandHome(input.transcript_path)!;
+
+  initTracing(config, input.cwd, input.session_id);
+
+  // Load state and read new messages.
+  const live = getSessionState(loadState(config.stateFilePath), input.session_id);
+  const sessionState = {
+    ...closing.session,
+    last_line: Math.max(closing.session.last_line, live.last_line),
+    task_run_map: { ...closing.session.task_run_map, ...live.task_run_map },
+    traced_tool_use_ids: [
+      ...new Set([
+        ...(closing.session.traced_tool_use_ids ?? []),
+        ...(live.traced_tool_use_ids ?? []),
+      ]),
+    ],
+  };
+
+  debug(`Last line: ${sessionState.last_line}, turn count: ${sessionState.turn_count}`);
+
+  // CLI version + approval policy: prefer state, fall back to the transcript.
+  const runtimeVersion = sessionState.runtime_version ?? readRuntimeVersion(transcriptPath);
+  const approvalPolicy = sessionState.approval_policy ?? input.permission_mode;
+
+  // Wait briefly for the transcript writer to flush. Stop fires as soon as the
+  // model finishes generating, but the JSONL file write may still be in flight.
+  await delay(Math.max(0, startTime + STOP_FLUSH_WAIT_MS - Date.now()));
+
+  const { messages, lastLine } = readTranscript(
+    transcriptPath,
+    sessionState.last_line,
+    closing.cut_bytes,
+  );
+  if (messages.length === 0 && !sessionState.current_turn_run_id) {
+    debug("No new messages");
+    return;
+  }
+
+  log(`Found ${messages.length} new messages`);
+
+  const notifiedBy = sessionState.current_notification_agent_id;
+  const notifiedFrom = notifiedBy
+    ? ((sessionState.task_run_map?.[notifiedBy]?.deferred as Record<string, unknown> | undefined)
+        ?.parent_run_id as string | undefined)
+    : undefined;
+  const sessionMetadata = await settledFromTurn(config.customMetadata, notifiedFrom);
+
+  // Group into turns and trace each one.
+  const turns = groupIntoTurns(messages);
+  const currentTracing = resolveTurnTracingMode(
+    config,
+    input.session_id,
+    sessionState.current_turn_tracing,
+    sessionState.current_turn_run_id
+      ? sessionState.open_turns?.[sessionState.current_turn_run_id]?.tracing
+      : undefined,
+  );
+
+  // The transcript file may not be fully flushed when this hook fires.
+  // If the last turn's final LLM call had tool calls but there's no
+  // subsequent LLM call, the final assistant response is missing from
+  // the transcript. Patch it using last_assistant_message from the hook
+  // input, which Claude Code guarantees is the complete final text.
+  // Use real wall-clock times: last_tool_end_time (from PostToolUse) as
+  // start, and Date.now() (Stop hook firing time) as end.
+  if (turns.length > 0 && input.last_assistant_message) {
+    const lastTurn = turns[turns.length - 1];
+    const lastLlm = lastTurn.llmCalls[lastTurn.llmCalls.length - 1];
+    if (lastLlm && lastLlm.toolCalls.length > 0) {
+      debug("Final LLM response missing from transcript, synthesizing from last_assistant_message");
+      const syntheticStart = sessionState.last_tool_end_time
+        ? new Date(sessionState.last_tool_end_time).toISOString()
+        : (lastLlm.toolCalls[lastLlm.toolCalls.length - 1].result?.timestamp ?? lastLlm.endTime);
+      const syntheticEnd = new Date(startTime).toISOString(); // startTime = when the Stop hook fired
+      lastTurn.llmCalls.push({
+        content: [{ type: "text", text: input.last_assistant_message }],
+        model: lastLlm.model,
+        // A request setting, so it carries over like the model. service_tier is a
+        // response value with no reading for this call, so it stays absent.
+        effort: lastLlm.effort,
+        usage: { input_tokens: 0, output_tokens: 0 },
+        startTime: syntheticStart,
+        endTime: syntheticEnd,
+        toolCalls: [],
+        synthetic: true,
+      });
+    }
+  }
+
+  let tracedTurns = 0;
+
+  // Collect task run mappings for subagent linking
+  let allTaskRunMaps: Record<string, TaskRunEntry> = {};
+
+  // The current_turn_run_id from state is for the LAST turn (the one that just completed)
+  // Earlier turns (from interruptions) are traced standalone
+  const currentRunId = sessionState.current_turn_run_id;
+  const currentTraceId = sessionState.current_trace_id;
+  const currentDottedOrder = sessionState.current_dotted_order;
+  const currentParentRunId = sessionState.current_parent_run_id;
+
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i];
+    const isLastTurn = i === turns.length - 1;
+    const turnNum = sessionState.turn_count + tracedTurns + 1;
+
+    // Only the last turn gets nested under the UserPromptSubmit run
+    const parentRunId = isLastTurn ? currentRunId : undefined;
+    const traceId = isLastTurn ? currentTraceId : undefined;
+    const dottedOrder = isLastTurn ? currentDottedOrder : undefined;
+
+    // Pass existing task_run_map and traced_tool_use_ids so we don't duplicate
+    // tools already traced by PostToolUse.
+    const existingTaskRunMap = isLastTurn ? sessionState.task_run_map : undefined;
+    const tracedToolUseIds = isLastTurn
+      ? new Set(sessionState.traced_tool_use_ids ?? [])
+      : undefined;
+
+    try {
+      const taskRunMap = await traceTurn({
+        // Earlier transcript turns have no original snapshot; never backfill them as full.
+        tracing: isLastTurn ? currentTracing : "metadata",
+        toolTracingModes: sessionState.tool_tracing_modes ?? {},
+        turn,
+        sessionId: input.session_id,
+        turnNum,
+        customMetadata: sessionMetadata,
+        hookCwd: input.cwd,
+        runtimeVersion,
+        approvalPolicy,
+
+        parentRunId,
+        existingTaskRunMap,
+        tracedToolUseIds,
+        traceId,
+        parentDottedOrder: dottedOrder,
+      });
+      allTaskRunMaps = { ...allTaskRunMaps, ...taskRunMap };
+      tracedTurns++;
+    } catch (err) {
+      error(`Failed to trace turn ${turnNum}: ${err}`);
+    }
+  }
+
+  // Re-read state so we pick up PostToolUse writes that may have landed after the Stop hook.
+  const freshState = loadState(config.stateFilePath);
+  const freshSession = getSessionState(freshState, input.session_id);
+
+  // Merge task_run_map entries written by PostToolUse with those from traceTurn
+  const mergedTaskRunMap = { ...freshSession.task_run_map, ...allTaskRunMaps };
+
+  const lastTurnId = turns[turns.length - 1]?.promptId;
+  const closingTurn = turns[turns.length - 1];
+  const closingTurnTools = closingTurn ? turnToolInputs(closingTurn) : [];
+  const turnMetadata = turnScopedMetadata(sessionMetadata, closingTurnTools, input.cwd);
+
+  // Process the pending subagent traces SubagentStop had queued when Stop fired. These are
+  // synchronous subagents whose SubagentStop fired before PostToolUse recorded
+  // the Agent tool run, so they were queued for us to trace here instead.
+  const pendingSubagents = sessionState.pending_subagent_traces || [];
+  const processedAgentIds = new Set<string>();
+  if (pendingSubagents.length > 0) {
+    debug(`Processing ${pendingSubagents.length} pending subagent trace(s)`);
+    await tracePendingSubagents({
+      tracing: currentTracing,
+      sessionId: input.session_id,
+      pendingSubagents,
+      taskRunMap: mergedTaskRunMap,
+      parentTraceId: sessionState.current_trace_id,
+      customMetadata: sessionMetadata,
+      runtimeVersion,
+      turnId: lastTurnId,
+      turnNumber: sessionState.current_turn_number,
+    });
+    for (const sa of pendingSubagents) processedAgentIds.add(sa.agent_id);
+  }
+
+  // Save updated state — re-read inside the lock so we don't clobber
+  // concurrent writes from PostToolUse/SubagentStop.
+  //
+  // If we traced 0 turns, don't advance last_line. This handles the race
+  // condition where Stop fires before the transcript contains the assistant
+  // response (e.g. only a file-history-snapshot + user message are on disk).
+  // Keeping last_line at its previous value lets the next Stop re-read from
+  // the same position and pick up the complete turn.
+  const savedLastLine = tracedTurns > 0 ? lastLine : sessionState.last_line;
+
+  // Decide — atomically, inside the lock — whether to complete this turn's run
+  // now or defer to the last SubagentStop. PostToolUse records each launched Agent
+  // under its turn in open_turns[turnRunId].agent_ids; SubagentStop (background) or
+  // this hook (sync, above) drains them as they're traced. If any background
+  // subagent for THIS turn is still in flight when we read inside the lock, we must
+  // defer so the turn's duration spans that work — recording stop_seen + the real
+  // outputs in the same write, so a SubagentStop finishing concurrently can't drain
+  // the turn without also seeing it's safe to complete. We always clear
+  // current_turn_run_id (the main loop is done with this turn); a deferred turn
+  // lives on in open_turns until its subagents drain. Whoever removes the turn from
+  // open_turns / clears current_turn_run_id under the lock owns the one completion.
+  let completeNow = false;
+  // If this turn is a task-notification turn, the async agent it reports on —
+  // claimed atomically below so only the Stop that actually completes the turn
+  // runs the finalize (guards against a concurrent/re-fired Stop doing it twice).
+  let notificationToFinalize: string | undefined;
+  // True when the notification this turn handled reported a killed/interrupted
+  // subagent — finalize without waiting on SubagentStop (which won't fire).
+  let notificationInterrupted = false;
+  // Background subagents whose task-notification was consumed *within* this turn
+  // (it's already in this turn's transcript) rather than arriving as a separate
+  // turn afterward. Only these should be finalized here: a separate notification
+  // turn still to come must be left alone so it can nest under the Agent run and
+  // finalize itself — finalizing early would delete the task_run_map entry and
+  // break that nesting. We detect "consumed within" by the agent id appearing in a
+  // traced turn's user content (its notification references it); the launch itself
+  // lives in tool_use/tool_result, not user content, so it doesn't false-match.
+  const notifiedWithinTurn = new Set<string>();
+  const knownAgentIds = Object.keys(sessionState.task_run_map ?? {});
+  if (knownAgentIds.length > 0) {
+    for (const t of turns) {
+      const uc = typeof t.userContent === "string" ? t.userContent : "";
+      for (const id of knownAgentIds) {
+        if (uc.includes(id)) notifiedWithinTurn.add(id);
+      }
+    }
+  }
+  let doneAgentsToFinalize: string[] = [];
+  await atomicUpdateState(config.stateFilePath, (latestState) => {
+    const latestSession = getSessionState(latestState, input.session_id);
+    const updatedState = updateSessionState(
+      latestState,
+      input.session_id,
+      Math.max(latestSession.last_line, savedLastLine),
+      Math.max(latestSession.turn_count, sessionState.turn_count + tracedTurns),
+      // Merge any late PostToolUse writes with our traced entries. allTaskRunMaps
+      // wins on conflicts since it has the fully resolved data from traceTurn.
+      { ...latestSession.task_run_map, ...allTaskRunMaps },
+    );
+    const s = updatedState[input.session_id];
+    // Match cursor semantics: if any turn traced, all parsed messages are consumed,
+    // including failed turns. If none traced, retain modes for the next replay.
+    if (tracedTurns > 0) {
+      Object.assign(
+        s,
+        advanceToolTracingProgress(latestSession, completedToolUseIds(turns), "transcript"),
+      );
+    }
+
+    const notifAgentId = sessionState.current_notification_agent_id;
+    const notifInterrupted = sessionState.current_notification_interrupted ?? false;
+
+    // Drop the sync subagents we just traced from the queue.
+    s.pending_subagent_traces = (latestSession.pending_subagent_traces ?? []).filter(
+      (sa) => !processedAgentIds.has(sa.agent_id),
+    );
+
+    const openTurns = { ...latestSession.open_turns };
+    const entry = currentRunId ? openTurns[currentRunId] : undefined;
+
+    if (currentRunId && entry) {
+      // This turn launched background subagents. Drain the ones we just traced and
+      // mark the main turn finished, stashing the outputs only this hook carries.
+      const remaining = entry.agent_ids.filter((id) => !processedAgentIds.has(id));
+      // Of those, the ones that already finished AND whose notification was
+      // consumed within this turn (no separate notification turn is coming) —
+      // finalize them after the lock so the turn doesn't hang. Agents finished but
+      // awaiting a *separate* notification turn are left for that turn to finalize.
+      doneAgentsToFinalize = remaining.filter(
+        (id) => latestSession.task_run_map?.[id]?.subagent_done && notifiedWithinTurn.has(id),
+      );
+      if (remaining.length > 0) {
+        openTurns[currentRunId] = {
+          ...entry,
+          agent_ids: remaining,
+          stop_seen: true,
+          tracing: entry.tracing ?? currentTracing,
+          last_assistant_message:
+            (entry.tracing ?? currentTracing) === "metadata"
+              ? MUTED_TRACE_CONTENT
+              : input.last_assistant_message,
+          turn_id: lastTurnId,
+          // If this turn is itself a task-notification turn that spawned its own
+          // background subagent, remember the agent to finalize once it drains.
+          notification_for_agent_id: notifAgentId ?? entry.notification_for_agent_id,
+        };
+        debug(`${remaining.length} background subagent(s) in flight, deferring turn completion`);
+      } else {
+        // All drained already — complete now and drop the entry.
+        completeNow = true;
+        notificationToFinalize = notifAgentId;
+        notificationInterrupted = notifInterrupted;
+        delete openTurns[currentRunId];
+      }
+    } else {
+      // No background subagents for this turn — normal inline completion.
+      completeNow = Boolean(currentRunId);
+      if (completeNow) {
+        notificationToFinalize = notifAgentId;
+        notificationInterrupted = notifInterrupted;
+      }
+    }
+    s.open_turns = openTurns;
+    return pruneOldSessions(updatedState);
+  });
+
+  // Complete the Turn run created by UserPromptSubmit (unless deferred above).
+  if (completeNow && currentRunId) {
+    debug(`Completing Turn run ${currentRunId}`);
+    try {
+      await completeTurnRun({
+        tracing: currentTracing,
+        sessionId: input.session_id,
+        runId: currentRunId,
+        traceId: currentTraceId,
+        dottedOrder: currentDottedOrder,
+        parentRunId: currentParentRunId,
+        startTime: sessionState.current_turn_start,
+        lastAssistantMessage: input.last_assistant_message,
+        customMetadata: turnMetadata,
+        turnId: lastTurnId,
+        turnNumber: sessionState.current_turn_number,
+        runtimeVersion,
+        approvalPolicy,
+      });
+      debug(`Turn run ${currentRunId} completed`);
+    } catch (err) {
+      error(`Failed to complete turn run: ${err}`);
+    }
+  }
+
+  // Finalize any background subagents that already finished within this turn (their
+  // notification was consumed here, so no separate notification turn will finalize
+  // them). finalizeNotificationChain closes each Agent tool run, drains it from the
+  // (just-deferred) launching turn, and completes that turn once fully drained.
+  for (const doneAgentId of doneAgentsToFinalize) {
+    debug(`Finalizing subagent ${doneAgentId} that finished within its launching turn`);
+    await finalizeNotificationChain({
+      defaultMuted: config.defaultMuted,
+      stateFilePath: config.stateFilePath,
+      sessionId: input.session_id,
+      customMetadata: config.customMetadata,
+      runtimeVersion,
+      agentId: doneAgentId,
+    });
+  }
+
+  // If this was a task-notification turn that completed now, finalize the agent's
+  // chain — but only once its subagent has actually been traced. SubagentStop and
+  // this notification turn fire in non-deterministic order; we close the agent's
+  // (open) tool run + launching turn from whichever runs LAST. Here (notification
+  // side): if SubagentStop already traced the agent (task_run_map subagent_done is
+  // set), we're last → finalize. Otherwise record this side as done and let
+  // SubagentStop do it.
+  if (notificationToFinalize && notificationInterrupted) {
+    // The subagent was killed/interrupted: SubagentStop never fires for it, so
+    // there's no join to wait on — finalize now, marking its tool run interrupted,
+    // rather than leaving the launching turn open until SessionEnd.
+    await finalizeNotificationChain({
+      defaultMuted: config.defaultMuted,
+      stateFilePath: config.stateFilePath,
+      sessionId: input.session_id,
+      customMetadata: config.customMetadata,
+      runtimeVersion,
+      agentId: notificationToFinalize,
+      interrupted: true,
+    });
+  } else if (notificationToFinalize) {
+    let finalizeNow = false;
+    await atomicUpdateState(config.stateFilePath, (s) => {
+      const ss = getSessionState(s, input.session_id);
+      if (ss.task_run_map?.[notificationToFinalize!]?.subagent_done) {
+        finalizeNow = true;
+        return s;
+      }
+      return {
+        ...s,
+        [input.session_id]: {
+          ...ss,
+          notification_done_agents: [
+            ...(ss.notification_done_agents ?? []).filter((id) => id !== notificationToFinalize),
+            notificationToFinalize!,
+          ],
+        },
+      };
+    });
+    if (finalizeNow) {
+      await finalizeNotificationChain({
+        defaultMuted: config.defaultMuted,
+        stateFilePath: config.stateFilePath,
+        sessionId: input.session_id,
+        customMetadata: config.customMetadata,
+        runtimeVersion,
+        agentId: notificationToFinalize,
+      });
+    }
+  }
+
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  log(`Processed ${tracedTurns} turns in ${duration}s`);
+
+  if (Date.now() - startTime > 180_000) {
+    warn(`Hook took ${duration}s (>3min), consider optimizing`);
+  }
+}

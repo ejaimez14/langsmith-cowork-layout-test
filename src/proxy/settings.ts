@@ -1,0 +1,454 @@
+import { accessSync, constants, mkdirSync, rmdirSync } from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
+import { configDir, endpoints, loadConfig, privatePath, userHome } from "./config.js";
+import {
+  CONFLICT_ENVIRONMENT_GUIDANCE,
+  CONFLICT_RETRY_GUIDANCE,
+  CONFLICT_SETTINGS_GUIDANCE,
+  CONFLICTING_AUTH_GUIDANCE,
+  CONFLICTING_BASE_GUIDANCE,
+  CREDENTIAL_SOURCE_GUIDANCE,
+  PINNED_CHANGE_GUIDANCE,
+  PINNED_FIELD_LABELS,
+  PROVIDER_ROUTING,
+  UPSTREAM,
+} from "./proxy-constants.js";
+import { sameHost } from "./config-validation.js";
+import type { ObjectValue, ProxyConfig, SetupResult } from "./proxy-models.js";
+import {
+  atomic,
+  transaction,
+  directory,
+  directories,
+  jsonText,
+  snapshot,
+  unchanged,
+  type Snapshot,
+} from "./files.js";
+import { createConfig, usableCLI, validateCLI } from "./setup.js";
+import { ensure, waitForStopped } from "./lifecycle.js";
+import { parseSetupArgs, parseDisableArgs, SetupError } from "./options.js";
+import {
+  targetPaths,
+  routingTargets,
+  routingSnapshot,
+  unchangedRouting,
+  routingEnv,
+  matchesRouting,
+  proxyKeyLine,
+  BASE,
+  HEADERS,
+} from "./scopes.js";
+export { SetupError } from "./options.js";
+
+const fail = (message: string): never => {
+  throw new SetupError(message);
+};
+function object(value: unknown): ObjectValue {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return fail("Expected a JSON object; settings were not replaced.");
+  return value as ObjectValue;
+}
+function text(value: unknown): string | undefined {
+  if (value === undefined) return;
+  if (typeof value !== "string") return fail("Transport settings must be strings.");
+  return value;
+}
+function lines(value: string | undefined): string[] {
+  return value === undefined ? [] : value.split("\n");
+}
+// Keep the exact generated representation, including blank lines and value spacing.
+function withProxyKey(headers: string | undefined, config: ProxyConfig): string {
+  return (headers ? headers + "\n" : "") + `X-LangSmith-Proxy-Key: ${config.secret}`;
+}
+function keyLine(line: string): boolean {
+  return /^\s*x-langsmith-proxy-key\s*:/i.test(line);
+}
+function validateHeaders(value: string | undefined): void {
+  for (const line of lines(value)) {
+    if (!line) continue;
+    const match = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+):[^\r\n]*$/.exec(line);
+    if (
+      !match ||
+      /^(authorization|proxy-authorization|x-api-key|x-langsmith-anthropic-passthrough)$/i.test(
+        match[1],
+      )
+    )
+      return fail("Conflicting or malformed custom headers; review them privately before setup.");
+    if (/^host$/i.test(match[1]))
+      fail(
+        "Custom Host headers are unsupported by persistent setup. Remove the Host header explicitly so the client uses the loopback target; review headers privately.",
+      );
+  }
+}
+function conflicting(
+  guidance: string,
+  path: string,
+  inEnvironment: string[],
+  inSettings: string[],
+): never {
+  const parts = [guidance];
+  if (inEnvironment.length)
+    parts.push(
+      `Found in your environment: ${inEnvironment.join(", ")}.`,
+      CONFLICT_ENVIRONMENT_GUIDANCE,
+    );
+  if (inSettings.length)
+    parts.push(
+      `Found in your settings file ${path}: ${inSettings.join(", ")}.`,
+      CONFLICT_SETTINGS_GUIDANCE,
+    );
+  parts.push(CONFLICT_RETRY_GUIDANCE);
+  return fail(parts.join(" "));
+}
+function changedFields(config: ProxyConfig, next: ProxyConfig, pinningCLI: boolean): string[] {
+  const before = { ...config, ...endpoints(config) };
+  const after = { ...next, ...endpoints(next) };
+  const keys = Object.keys(PINNED_FIELD_LABELS) as (keyof typeof PINNED_FIELD_LABELS)[];
+  return keys
+    .filter((key) => (key !== "cli" || pinningCLI) && before[key] !== after[key])
+    .map((key) => PINNED_FIELD_LABELS[key]);
+}
+function settings(s: Snapshot | undefined): { value: ObjectValue; env: ObjectValue } {
+  const value = s ? object(JSON.parse(s.text)) : {};
+  const env = value.env === undefined ? {} : object(value.env);
+  return { value, env };
+}
+function supportedHome(home: string, env: NodeJS.ProcessEnv): void {
+  if (env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR !== join(home, ".claude"))
+    fail(
+      "Custom CLAUDE_CONFIG_DIR is unsupported. Restart Claude Code with its default configuration directory, then use /langsmith-gateway:setup or /langsmith-gateway:disable.",
+    );
+}
+function lock(home: string): () => void {
+  directories(home, true);
+  const dir = configDir(home);
+  try {
+    mkdirSync(dir, { mode: 0o700 });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+  }
+  privatePath(dir, true);
+  const path = join(dir, "settings.lock");
+  try {
+    mkdirSync(path, { mode: 0o700 });
+  } catch {
+    return fail(
+      "Another setup/disable is running or left settings.lock. Stop it before removing that lock directory and retrying.",
+    );
+  }
+  return () => rmdirSync(path);
+}
+function discoverCLI(env: NodeJS.ProcessEnv): string {
+  for (const dir of (env.PATH ?? "").split(":")) {
+    if (!isAbsolute(dir)) continue;
+    const path = join(dir, "langsmith");
+    try {
+      accessSync(path, constants.X_OK);
+      return path;
+    } catch {
+      /* Try next absolute PATH entry. */
+    }
+  }
+  return fail(CREDENTIAL_SOURCE_GUIDANCE);
+}
+export async function enable(
+  entry: string,
+  args: string[],
+  env = process.env,
+  home = userHome(),
+  cwd = process.cwd(),
+): Promise<SetupResult> {
+  const requested = parseSetupArgs(args);
+  supportedHome(home, env);
+  // Reject unsupported config before creating directories or a settings lock.
+  loadConfig(home, true);
+  const unlock = lock(home);
+  try {
+    const p = targetPaths(home, requested.scope, cwd);
+    directory(dirname(p.settings), true);
+    const beforeSettings = snapshot(p.settings);
+    const { value, env: savedEnv } = settings(beforeSettings);
+    if (value.disableAllHooks === true)
+      fail(
+        "Persistent setup requires hooks to restart the daemon. Set disableAllHooks to false or remove it explicitly from user settings before retrying; it will not be overwritten.",
+      );
+    const authInEnvironment = PROVIDER_ROUTING.filter((key) => env[key] !== undefined);
+    const authInSettings = PROVIDER_ROUTING.filter((key) => savedEnv[key] !== undefined);
+    if (authInEnvironment.length || authInSettings.length)
+      conflicting(CONFLICTING_AUTH_GUIDANCE, p.settings, authInEnvironment, authInSettings);
+    if (value.apiKeyHelper !== undefined)
+      fail(
+        "Conflicting apiKeyHelper. Remove it explicitly before setup; it will not be overwritten.",
+      );
+    const base = text(savedEnv[BASE]),
+      headers = text(savedEnv[HEADERS]);
+    validateHeaders(headers);
+    let config = loadConfig(home, true);
+    const initiallyEnabled = loadConfig(home) !== undefined;
+    const targets = routingTargets(home, cwd, config);
+    const active = config
+      ? targets.filter((item) => matchesRouting(routingEnv(item.saved), config!))
+      : [];
+    const settingsTargets = [...new Set([...active.map((item) => item.path), p.settings])];
+    if (settingsTargets.length > 128)
+      fail("Too many active routing targets; disable unused scopes before setup.");
+    const prior = !!config && matchesRouting(savedEnv, config);
+    const port = requested.port ?? config?.port ?? 52507;
+    const selected =
+      requested.apiUrl === undefined ? endpoints(config ?? {}) : endpoints(requested);
+    const useClaudeSubscription = requested.useClaudeSubscription;
+    const next = config
+      ? {
+          ...config,
+          enabled: true,
+          ...selected,
+          useClaudeSubscription,
+          cli:
+            requested.cli === undefined
+              ? usableCLI(config.cli, requested.identityTokenCommand ?? config.identityTokenCommand)
+              : validateCLI(requested.cli),
+          profile: requested.profile ?? config.profile,
+          port,
+          identityTokenCommand: requested.identityTokenCommand ?? config.identityTokenCommand,
+          identityTokenTtlMs: requested.identityTokenTtlMs ?? config.identityTokenTtlMs,
+          workspaceId: requested.workspaceId ?? config.workspaceId,
+        }
+      : undefined;
+    const changed = config && next ? changedFields(config, next, requested.cli !== undefined) : [];
+    if (changed.length && (initiallyEnabled || active.length))
+      fail(
+        `Setup would change settings an active scope is already using: ${changed.join(", ")}. ${PINNED_CHANGE_GUIDANCE}`,
+      );
+    const modeChanged = !!config && config.useClaudeSubscription !== useClaudeSubscription;
+    const switching = initiallyEnabled && modeChanged;
+    if (modeChanged && active.some((item) => item.path !== p.settings))
+      fail(
+        "Subscription forwarding is shared. Disable every other active scope first, then retry setup for this scope; other scopes will not be silently switched.",
+      );
+    if (switching && !prior)
+      fail(
+        "Only the sole active configured target can switch subscription forwarding in place. Disable existing routing first, then retry setup.",
+      );
+    const target = `http://127.0.0.1:${port}`;
+    const ours = (value: string | undefined) =>
+      value !== undefined &&
+      value !== target &&
+      (sameHost(value, selected.gatewayUrl) || sameHost(value, UPSTREAM));
+    const baseOverwritten = ours(env[BASE]) || ours(base);
+    const baseInEnvironment =
+      env[BASE] !== undefined && env[BASE] !== target && !ours(env[BASE]) ? [BASE] : [];
+    const baseInSettings = base !== undefined && base !== target && !ours(base) ? [BASE] : [];
+    if (baseInEnvironment.length || baseInSettings.length)
+      conflicting(CONFLICTING_BASE_GUIDANCE, p.settings, baseInEnvironment, baseInSettings);
+    const retainedHeaders = !!config && !prior && env[HEADERS] === withProxyKey(headers, config);
+    // Do not copy shell/project headers (potential secrets) into user settings.
+    if (
+      env[HEADERS] !== undefined &&
+      env[HEADERS] !== headers &&
+      !retainedHeaders &&
+      !(config && active.some(({ saved }) => routingEnv(saved)[HEADERS] === env[HEADERS]))
+    )
+      fail(
+        "Inherited custom headers differ from the selected scope settings and do not match trusted local transport. Resolve the override privately before setup; it will not be copied into settings.",
+      );
+    const expectedKey = config ? `X-LangSmith-Proxy-Key: ${config.secret}` : undefined;
+    const keys = lines(headers).filter(keyLine);
+    if (keys.length && (!config || keys.length !== 1 || keys[0] !== expectedKey))
+      fail("Conflicting local proxy header; no different header will be replaced.");
+    if (switching && (base !== target || keys.length !== 1))
+      fail(
+        "Configured transport settings changed. Review them privately or disable this scope before switching subscription forwarding.",
+      );
+    if (!config) {
+      createConfig(
+        requested.cli ??
+          (requested.identityTokenCommand === undefined ? discoverCLI(env) : undefined),
+        requested.profile,
+        port,
+        home,
+        selected,
+        useClaudeSubscription,
+        {
+          identityTokenCommand: requested.identityTokenCommand,
+          identityTokenTtlMs: requested.identityTokenTtlMs,
+          workspaceId: requested.workspaceId,
+        },
+      );
+      config = loadConfig(home)!;
+    }
+    const effective = next ?? config;
+    if (effective.cli !== undefined && validateCLI(effective.cli) !== effective.cli)
+      fail("Pinned CLI path changed; resolve privately before retrying.");
+    let configSnapshot = snapshot(p.config, true);
+    if (switching) {
+      unchanged(p.settings, beforeSettings);
+      for (const item of targets) unchangedRouting(item.path, item.saved);
+      // Persist the requested mode, disabled, before waiting. Old versions also
+      // recognize disabled config. Keep transport/key untouched and never
+      // restore subscription forwarding automatically after an opt-out failure.
+      atomic(p.config, jsonText({ ...next!, enabled: false }), configSnapshot);
+      configSnapshot = snapshot(p.config, true);
+    }
+    // A disabled old daemon must see disabled config before re-enable can erase
+    // that signal. Wait before changing even the port/profile: never race refresh.
+    if ((!initiallyEnabled || switching) && next) {
+      await waitForStopped(config).catch(() =>
+        fail(
+          "Old proxy still draining or local port occupied. Config remains disabled; routing settings and requested mode are retained. Wait at least 35 seconds and retry the same setup options; resolve port conflicts privately without killing an unknown listener.",
+        ),
+      );
+      unchanged(p.config, configSnapshot, true);
+      unchanged(p.settings, beforeSettings);
+      for (const item of targets) unchangedRouting(item.path, item.saved);
+      config = next;
+    }
+    if (!loadConfig(home)) atomic(p.config, jsonText(config), configSnapshot);
+    const currentConfig = snapshot(p.config, true);
+    try {
+      await ensure(config, entry);
+      directories(home);
+      privatePath(configDir(home), true);
+      unchanged(p.settings, beforeSettings);
+      unchanged(p.config, currentConfig, true);
+      for (const item of targets) unchangedRouting(item.path, item.saved);
+      directory(dirname(p.settings));
+      const afterHeaders = keys.length ? headers! : withProxyKey(headers, config);
+      savedEnv[BASE] = target;
+      savedEnv[HEADERS] = afterHeaders;
+      value.env = savedEnv;
+      const settingsChanged = base !== target || headers !== afterHeaders;
+      transaction([
+        {
+          path: p.config,
+          text: jsonText({
+            ...config,
+            settingsTargets,
+          }),
+          prior: currentConfig,
+        },
+        ...(settingsChanged
+          ? [{ path: p.settings, text: jsonText(value), prior: beforeSettings }]
+          : []),
+      ]);
+      return {
+        settingsChanged,
+        useClaudeSubscription: config.useClaudeSubscription,
+        modeChanged,
+        baseOverwritten,
+      };
+    } catch (error) {
+      // Leave settings untouched on readiness failure; a newly created/re-enabled
+      // daemon sees disabled config and drains. Existing enabled installs stay enabled.
+      if (!initiallyEnabled || switching) {
+        // A failed settings write may have rolled back the config transaction
+        // with a new inode. Disable only if its exact pre-transaction text remains.
+        const rolledBack = snapshot(p.config, true);
+        if (rolledBack?.text !== currentConfig?.text) throw error;
+        atomic(p.config, jsonText({ ...config, enabled: false }), rolledBack);
+      }
+      if (switching)
+        fail(
+          "Gateway mode switch did not complete. Config remains disabled with the requested mode; routing settings are retained. Retry the same setup options after resolving local daemon readiness privately.",
+        );
+      throw error;
+    }
+  } finally {
+    unlock();
+  }
+}
+
+export function modeSummary(useClaudeSubscription: boolean, modeChanged: boolean): string {
+  return (
+    (useClaudeSubscription
+      ? "Claude subscription credential forwarding enabled (gateway/provider eligibility applies). "
+      : "OAuth-only gateway auth; native credentials are not forwarded. Gateway provider keys and provider billing apply. ") +
+    (modeChanged
+      ? "Daemon mode changed after draining; routing settings retained, with brief local downtime. "
+      : "")
+  );
+}
+
+export function disable(
+  args: string[],
+  env = process.env,
+  home = userHome(),
+  cwd = process.cwd(),
+): void {
+  const requested = parseDisableArgs(args);
+  supportedHome(home, env);
+  if (!loadConfig(home, true)) return;
+  const unlock = lock(home);
+  try {
+    const config = loadConfig(home, true);
+    if (!config) return;
+    const p = targetPaths(home, requested.scope, cwd);
+    const targets = routingTargets(home, cwd, config);
+    const configSnapshot = snapshot(p.config, true);
+    const before = targets.find((item) => item.path === p.settings)?.saved;
+    const { value, env: savedEnv } = settings(before);
+    let routingRemoved = false;
+    if (savedEnv[BASE] === `http://127.0.0.1:${config.port}`) {
+      delete savedEnv[BASE];
+      routingRemoved = true;
+    }
+    const current = text(savedEnv[HEADERS]);
+    if (current !== undefined) {
+      const remaining = lines(current).filter((line) => line !== proxyKeyLine(config));
+      if (remaining.length !== lines(current).length) {
+        routingRemoved = true;
+        if (remaining.length) savedEnv[HEADERS] = remaining.join("\n");
+        else delete savedEnv[HEADERS];
+      }
+    }
+    if (routingRemoved && Object.keys(savedEnv).length === 0) delete value.env;
+    else if (value.env !== undefined) value.env = savedEnv;
+    const remainingTargets = targets.filter(
+      (item) => item.path !== p.settings && matchesRouting(routingEnv(item.saved), config),
+    );
+    if (remainingTargets.length > 128)
+      fail("Too many active routing targets; review the private target index before disable.");
+    const writes: { path: string; text: string; prior: Snapshot | undefined }[] = [];
+    if (before && JSON.stringify(value) !== JSON.stringify(JSON.parse(before.text)))
+      writes.push({ path: p.settings, text: jsonText(value), prior: before });
+    writes.push({
+      path: p.config,
+      text: jsonText({
+        ...config,
+        enabled: loadConfig(home) !== undefined && remainingTargets.length > 0,
+        settingsTargets: remainingTargets.map((item) => item.path),
+      }),
+      prior: configSnapshot,
+    });
+    for (const item of targets) unchangedRouting(item.path, item.saved);
+    transaction(writes);
+    // Config watcher drains within five seconds; never kills a listener by PID/port.
+  } finally {
+    unlock();
+  }
+}
+
+export function routingStatus(paths: ReturnType<typeof targetPaths>, config?: ProxyConfig): string {
+  const current = routingSnapshot(paths.settings);
+  const env = routingEnv(current);
+  const prefix = `settings ${current ? "present" : "missing"}; `;
+  if (!config) return prefix + "proxy setup is missing";
+  if (matchesRouting(env, config)) return prefix + "configured to use the local gateway proxy";
+  const headers = env[HEADERS];
+  const keys = typeof headers === "string" ? lines(headers).filter(keyLine) : [];
+  if (env[BASE] === undefined || env[BASE] === "")
+    return (
+      prefix +
+      (keys.length
+        ? "gateway routing is incomplete; local proxy authentication header is present but Claude’s saved API address is missing"
+        : "gateway routing is not configured in this settings file")
+    );
+  if (env[BASE] !== `http://127.0.0.1:${config.port}`)
+    return prefix + "Claude’s saved API address differs from this proxy’s address";
+  return (
+    prefix +
+    (keys.length === 0
+      ? "local proxy authentication header is missing"
+      : "local proxy authentication header does not match")
+  );
+}

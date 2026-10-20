@@ -1,0 +1,229 @@
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import { binary } from "../binary-target.js";
+import { HOOK_EVENT_NAMES } from "../constants.js";
+import cursorHooks from "../fixtures/cursor-hooks.json" with { type: "json" };
+import { noManagedConfigEnv } from "../fixtures/no-managed-config-env.js";
+
+const EXECUTABLE_NAME = binary.target.executableName;
+
+const root = new URL("../../", import.meta.url);
+const bundle = fileURLToPath(new URL("bundle/dispatch.js", root));
+const { version } = JSON.parse(readFileSync(new URL("package.json", root), "utf8"));
+
+let home: string;
+beforeEach(() => (home = mkdtempSync(join(tmpdir(), "ls-dispatch-"))));
+afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+// Claude Code runs the bundle, not the source, so drive the built artifact.
+function dispatch(args: string[], prompt = "ordinary prompt", cwd = home, filler = "") {
+  return spawnSync(process.execPath, [bundle, ...args], {
+    cwd,
+    env: {
+      HOME: home,
+      PATH: "",
+      ...noManagedConfigEnv(),
+      TRACE_TO_LANGSMITH: "false",
+      STATE_FILE: join(home, "state.json"),
+    },
+    input: JSON.stringify({
+      session_id: "dispatch-test",
+      transcript_path: join(home, "missing.jsonl"),
+      cwd: home,
+      prompt,
+      tool_response: filler,
+    }),
+    encoding: "utf8",
+    timeout: 10000,
+  });
+}
+
+// A handler's initHook creates this directory, so it is proof the handler ran.
+const logDir = () => join(home, ".claude", "state");
+
+describe("bundle/dispatch.js", () => {
+  it("prints the package version for --version", () => {
+    const result = dispatch(["--version"]);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout.trim()).toBe(version);
+    expect(existsSync(logDir())).toBe(false);
+  });
+
+  it.each(HOOK_EVENT_NAMES)(
+    "runs the %s handler and writes no state while tracing is off",
+    (event) => {
+      const result = dispatch([event]);
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe("");
+      expect(existsSync(logDir()), result.stderr).toBe(true);
+      expect(existsSync(join(home, "state.json"))).toBe(false);
+    },
+  );
+
+  function dispatchPayload(event: string, payload: unknown, env: Record<string, string>) {
+    return spawnSync(process.execPath, [bundle, event], {
+      cwd: home,
+      env: {
+        HOME: home,
+        PATH: "",
+        STATE_FILE: join(home, "state.json"),
+        ...noManagedConfigEnv(),
+        ...env,
+      },
+      input: JSON.stringify(payload),
+      encoding: "utf8",
+      timeout: 10000,
+    });
+  }
+
+  // Tracing on with an unreachable endpoint, so a handler that fails to stand down leaves a trail.
+  function dispatchTracing(event: string, payload: unknown) {
+    return dispatchPayload(event, payload, {
+      TRACE_TO_LANGSMITH: "true",
+      CC_LANGSMITH_API_KEY: "test-key",
+      LANGSMITH_ENDPOINT: "http://127.0.0.1:1",
+      // Cursor sets both of these too, so neither can be the signal.
+      CLAUDE_PROJECT_DIR: home,
+      CLAUDE_PLUGIN_ROOT: home,
+    });
+  }
+
+  function claudePayload(event: string) {
+    return {
+      session_id: "dispatch-test",
+      transcript_path: join(home, "missing.jsonl"),
+      cwd: home,
+      hook_event_name: event,
+      prompt: "ordinary prompt",
+    };
+  }
+
+  function expectStoodDown(result: ReturnType<typeof dispatchTracing>) {
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("");
+    expect(existsSync(logDir())).toBe(false);
+    expect(existsSync(join(home, "state.json"))).toBe(false);
+  }
+
+  it.each(HOOK_EVENT_NAMES)("stands the %s handler down for a Cursor payload", (event) => {
+    expectStoodDown(dispatchTracing(event, cursorHooks.beforeSubmitPrompt));
+  });
+
+  it.each(HOOK_EVENT_NAMES)("runs the %s handler when the payload names that event", (event) => {
+    const result = dispatchPayload(event, claudePayload(event), { TRACE_TO_LANGSMITH: "false" });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(logDir()), result.stderr).toBe(true);
+  });
+
+  it("stands down when the payload names another Claude Code event", () => {
+    expectStoodDown(dispatchTracing("Stop", claudePayload("PreToolUse")));
+  });
+
+  it("leaves stderr silent when git runs outside a repository", () => {
+    const result = spawnSync(process.execPath, [bundle, "UserPromptSubmit"], {
+      cwd: home,
+      env: {
+        HOME: home,
+        PATH: process.env.PATH ?? "",
+        ...noManagedConfigEnv(),
+        TRACE_TO_LANGSMITH: "false",
+        STATE_FILE: join(home, "state.json"),
+      },
+      input: JSON.stringify({
+        session_id: "dispatch-test",
+        transcript_path: join(home, "missing.jsonl"),
+        cwd: home,
+        prompt: "ordinary prompt",
+      }),
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe("");
+  });
+
+  // Only UserPromptSubmit answers the trace command, so its reply pins the routing.
+  it.each(HOOK_EVENT_NAMES)("routes %s to that event's own handler", (event) => {
+    const result = dispatch([event], "/langsmith-tracing:trace");
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    const decision = result.stdout === "" ? undefined : JSON.parse(result.stdout).decision;
+    expect(decision).toBe(event === "UserPromptSubmit" ? "block" : undefined);
+  });
+
+  it("logs and still exits 0 when a handler cannot read its input", () => {
+    const result = spawnSync(process.execPath, [bundle, "PostToolUse"], {
+      cwd: home,
+      env: { HOME: home, PATH: "", STATE_FILE: join(home, "state.json"), ...noManagedConfigEnv() },
+      input: "not json",
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(readFileSync(join(logDir(), "hook.log"), "utf8")).toContain(
+      "PostToolUse hook fatal error",
+    );
+  });
+
+  it.each([[], ["NotAnEvent"], ["SessionStart"], ["userpromptsubmit"]])(
+    "logs a diagnostic and runs no handler for argv %j",
+    (...args) => {
+      const result = dispatch(args);
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe("");
+      expect(readFileSync(join(logDir(), "hook.log"), "utf8")).toContain("Unknown hook event");
+      expect(existsSync(join(home, "state.json"))).toBe(false);
+    },
+  );
+
+  it.each(["--help", "-h"])("prints the usage for %s and runs no handler", (flag) => {
+    const result = dispatch([flag]);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("Usage:");
+    expect(result.stdout).toContain(`${EXECUTABLE_NAME} <HookEventName>`);
+    expect(result.stdout).toContain("--help, -h");
+    expect(result.stdout).toContain("--version, -v");
+    expect(existsSync(logDir())).toBe(false);
+  });
+
+  it("names every hook event and flag it accepts in the usage", () => {
+    const usage = dispatch(["--help"]).stdout;
+    expect(usage).toContain("<HookEventName>");
+    for (const flag of ["--help", "-h", "--version", "-v"]) {
+      expect(usage, flag).toContain(flag);
+    }
+  });
+
+  it("prints the same version for -v as for --version", () => {
+    expect(dispatch(["-v"]).stdout.trim()).toBe(version);
+  });
+
+  it.each(["--instal", "-x", "--print"])(
+    "rejects the unknown option %s with the usage and runs no handler",
+    (flag) => {
+      const result = dispatch([flag]);
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain(`unknown option: ${flag}`);
+      expect(result.stderr).toContain("Usage:");
+      expect(existsSync(logDir())).toBe(false);
+    },
+  );
+});

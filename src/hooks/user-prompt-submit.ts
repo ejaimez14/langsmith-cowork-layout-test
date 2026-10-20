@@ -1,0 +1,389 @@
+/**
+ * UserPromptSubmit hook handler.
+ *
+ * Invoked when a user submits a prompt, before Claude processes it.
+ * Creates the initial run for the turn and stores the run ID
+ * for the Stop hook to use as the parent for all LLM and tool runs.
+ *
+ * Also handles interrupted turns: if Stop never fired for the previous turn
+ * (user pressed Escape), traces the interrupted turn's content from the
+ * transcript before closing it with "User interrupt".
+ */
+
+import { debug, error } from "../logger.js";
+import {
+  closeInterruptedTurn,
+  generateDottedOrderSegment,
+  parseDottedOrder,
+} from "../langsmith.js";
+import { finalizeNotificationChain } from "../finalize.js";
+import { captureRun, initTracing, settledFromTurn } from "../tracing-engine.js";
+import { stableRunId } from "../utils/ids/run-id.js";
+import {
+  loadState,
+  atomicUpdateState,
+  getSessionState,
+  advanceToolTracingProgress,
+} from "../state.js";
+import { getTranscriptEndLine, readRuntimeVersion } from "../transcript.js";
+import { initHook, expandHome } from "../utils/hook-init.js";
+import { isPayloadForHook } from "../utils/harness.js";
+import { readStdin } from "../utils/stdin.js";
+import { KILLED_NOTIFICATION_STATUS, USER_PROMPT_TURN_NAME } from "../constants.js";
+import { codingAgentMetadata } from "../metadata.js";
+import { loadConfig } from "../config.js";
+import { describeThreadLinks } from "../thread-link.js";
+import {
+  parseTracingCommand,
+  setThreadTracingMode,
+  getThreadTracingMode,
+} from "../tracing-policy.js";
+import { queueClosing } from "../closing-queue.js";
+import type {
+  Config,
+  InterruptedClosingInput,
+  QueuedClosing,
+  UserPromptSubmitHookInput,
+} from "../types.js";
+
+export async function main(): Promise<void> {
+  const hookStartTime = Date.now();
+  const input: UserPromptSubmitHookInput = await readStdin();
+  if (!isPayloadForHook(input, "UserPromptSubmit")) return;
+
+  // Local commands must be handled before the master switch, credentials, or
+  // any tracing/turn-state work. Even failures consume the prompt, not the model.
+  const command = parseTracingCommand(input.prompt);
+  if (command) {
+    let reason: string;
+    try {
+      const commandConfig = loadConfig({ cwd: input.cwd });
+      if (command === "trace") {
+        reason = await describeThreadLinks(commandConfig, input.session_id);
+      } else {
+        const mode = command === "mute" ? "metadata" : "full";
+        const result = await setThreadTracingMode(
+          commandConfig.stateFilePath,
+          input.session_id,
+          mode,
+        );
+        reason = `Thread tracing ${command === "mute" ? "muted (metadata-only)" : "unmuted (full content)"}. Preference saved for the next turn; the current turn is unchanged.`;
+        // Filesystem warnings stay in this local, blocked response, never tracing.
+        if (result?.warning) reason += ` Warning: ${result.warning}.`;
+        if (commandConfig.managedConfigProblem) {
+          reason += ` ${commandConfig.managedConfigProblem}`;
+        } else if (!commandConfig.enabled) {
+          reason += " Master tracing is disabled; this preference does not enable it.";
+        } else if (
+          !commandConfig.apiKey &&
+          (!commandConfig.replicas || commandConfig.replicas.length === 0)
+        ) {
+          reason += " Tracing remains inactive until credentials are configured.";
+        }
+      }
+    } catch (err) {
+      reason =
+        command === "trace"
+          ? `Could not run the trace command. Session ID: ${input.session_id}. No tracing settings were changed.`
+          : `Could not ${command} thread tracing: ${err instanceof Error ? err.message : String(err)}. Tracing may still be enabled. Command blocked; no model turn was started.`;
+    }
+    try {
+      console.log(JSON.stringify({ decision: "block", reason }));
+    } catch (err) {
+      error(`Could not write the ${command} command response: ${err}`);
+    }
+    return;
+  }
+
+  const config = initHook(input.cwd);
+  if (!config) {
+    const { managedConfigProblem, stateFilePath } = loadConfig({ cwd: input.cwd });
+    if (managedConfigProblem) {
+      let firstInSession = false;
+      await atomicUpdateState(stateFilePath, (s) => {
+        const ss = getSessionState(s, input.session_id);
+        if (ss.managed_notice_shown) return s;
+        firstInSession = true;
+        const updated = new Date().toISOString();
+        return { ...s, [input.session_id]: { ...ss, managed_notice_shown: true, updated } };
+      });
+      if (firstInSession) console.log(JSON.stringify({ systemMessage: managedConfigProblem }));
+    }
+    return;
+  }
+
+  debug(`UserPromptSubmit hook started, session=${input.session_id}`);
+
+  // Subagent turns are traced entirely by the Stop hook from the transcript.
+  // Skip here to avoid orphan runs with incorrect nesting. Only agent_id marks
+  // a subagent: the main session also reports agent_type when the session runs
+  // as a named agent, and skipping it there drops the turn's parent run.
+  if (input.agent_id) {
+    debug("Skipping UserPromptSubmit for subagent — Stop hook handles tracing");
+    return;
+  }
+
+  initTracing(config, input.cwd, input.session_id);
+
+  const state = loadState(config.stateFilePath);
+  const sessionState = getSessionState(state, input.session_id);
+  const turnMode = getThreadTracingMode(
+    config.stateFilePath,
+    input.session_id,
+    config.defaultMuted,
+  );
+
+  // CLI version (ls_agent_runtime_version); best-effort, Stop backfills if empty.
+  const expandedTranscript = expandHome(input.transcript_path);
+  const runtimeVersion =
+    (expandedTranscript ? readRuntimeVersion(expandedTranscript) : undefined) ??
+    sessionState.runtime_version;
+  const approvalPolicy = input.permission_mode;
+
+  // If state is fresh (last_line === -1) but the transcript already has content,
+  // skip to the end. This avoids replaying thousands of old messages (which would
+  // be rejected by LangSmith's ±24h timestamp window) when state is lost due to
+  // file deletion, corruption, or session pruning.
+  let interruptedLastLine = sessionState.last_line;
+  const awaitingUploader =
+    Boolean(sessionState.current_turn_run_id) ||
+    Object.keys(sessionState.queued_closings ?? {}).length > 0;
+  if (interruptedLastLine === -1 && !awaitingUploader && input.transcript_path) {
+    const transcriptPath = expandHome(input.transcript_path)!;
+    const endLine = getTranscriptEndLine(transcriptPath);
+    if (endLine > 0) {
+      debug(`Fresh state but transcript has ${endLine + 1} lines — skipping to end`);
+      interruptedLastLine = endLine;
+    }
+  }
+
+  // If there's a stale turn run, the previous turn was interrupted (Stop never fired).
+  // The uploader traces its content and closes it; this turn counts it now.
+  let countedTurns = sessionState.turn_count;
+  if (sessionState.current_turn_run_id) {
+    // A stale current_turn_run_id means the previous turn's Stop never fired. The
+    // usual cause is a user interrupt — but it also happens when several background
+    // agents finish at once: their task-notifications arrive faster than the agent
+    // responds, so a notification turn is superseded by the next before its Stop.
+    // That's not a user interrupt: close it with an accurate status and, since its
+    // launching turn is still deferred, finalize that chain so it doesn't hang.
+    const supersededNotificationAgentId = sessionState.current_notification_agent_id;
+    debug(
+      `Closing stale turn ${sessionState.current_turn_run_id}` +
+        (supersededNotificationAgentId ? " (superseded task-notification)" : " (interrupted)"),
+    );
+    const { prompt: _prompt, ...closingInput } = input;
+    await queueClosing(
+      config,
+      "interrupted",
+      {
+        ...closingInput,
+        error: supersededNotificationAgentId
+          ? "Superseded by a newer task-notification"
+          : "User interrupt",
+      },
+      { transcriptCut: true },
+    );
+    countedTurns = Math.max(countedTurns, sessionState.current_turn_number ?? 0);
+  }
+
+  const turnNum = countedTurns + 1;
+
+  const startTime = new Date().toISOString();
+  const runId = stableRunId(startTime, input.session_id, turnNum);
+  const segment = generateDottedOrderSegment(startTime, runId);
+
+  // Decide where this turn nests.
+  let traceId: string;
+  let parentRunId: string | undefined;
+  let dottedOrder: string;
+
+  // A task-notification turn is the main agent reacting to a finished background
+  // subagent. Detect + correlate in one step by matching the prompt against the
+  // agent_ids in task_run_map. We match by the launch-time task_run_map entry
+  // (recorded by PostToolUse), not by whether SubagentStop has finished: a
+  // background agent finishing while the main agent is idle can fire this
+  // notification's UserPromptSubmit *before* SubagentStop, so a finished marker may
+  // not be set yet — but the launch-time entry always is. A notification
+  // necessarily references its agent by id, so an id substring match is robust to
+  // message-format changes; a 17-char hex id colliding with human text is
+  // astronomically unlikely. (Reading origin.kind from the transcript doesn't work
+  // here either — the prompt's line often isn't flushed to disk when this fires.)
+  // A match nests the turn under that subagent's Agent tool run instead of
+  // cluttering the top-level turn sequence.
+  const notifAgentId = Object.keys(sessionState.task_run_map ?? {}).find((id) =>
+    input.prompt.includes(id),
+  );
+  const agentToolRun = notifAgentId ? sessionState.task_run_map?.[notifAgentId] : undefined;
+  const notificationAgentId = agentToolRun ? notifAgentId : undefined;
+  // A cancelled subagent's notification reports a terminal <status> like "killed".
+  // There's no structured field for it, so read the one tag from the body — only
+  // to distinguish a forcibly-stopped subagent from a normal one, not to
+  // detect/correlate. When killed, SubagentStop never fires, so Stop must finalize
+  // without waiting on it. Only known cancellation statuses count (allowlist);
+  // anything else (including a new/unknown status) is treated as a normal turn.
+  const notificationStatus = notificationAgentId
+    ? /<status>([^<]+)<\/status>/.exec(input.prompt)?.[1]
+    : undefined;
+  const notificationInterrupted = notificationStatus?.toLowerCase() === KILLED_NOTIFICATION_STATUS;
+
+  if (agentToolRun) {
+    traceId = parseDottedOrder(agentToolRun.dotted_order).traceId;
+    parentRunId = agentToolRun.run_id;
+    dottedOrder = `${agentToolRun.dotted_order}.${segment}`;
+    debug(
+      `Task-notification for agent ${notifAgentId}, nesting turn under Agent run ${parentRunId}`,
+    );
+  } else if (config.parentDottedOrder) {
+    // If a parent dotted_order is provided, nest this turn under the existing run.
+    const parsed = parseDottedOrder(config.parentDottedOrder);
+    traceId = parsed.traceId;
+    parentRunId = parsed.runId;
+    dottedOrder = `${config.parentDottedOrder}.${segment}`;
+    debug(`Nesting under parent run ${parentRunId} (trace ${traceId})`);
+  } else {
+    traceId = runId;
+    parentRunId = undefined;
+    dottedOrder = segment;
+  }
+
+  const launchingTurnId = (agentToolRun?.deferred as Record<string, unknown> | undefined)
+    ?.parent_run_id as string | undefined;
+  const inherited = await settledFromTurn(config.customMetadata, launchingTurnId);
+
+  await captureRun(
+    {
+      id: runId,
+      name: USER_PROMPT_TURN_NAME,
+      run_type: "chain",
+      inputs: { messages: [{ role: "user", content: input.prompt }] },
+      start_time: startTime,
+      trace_id: traceId,
+      dotted_order: dottedOrder,
+      ...(parentRunId ? { parent_run_id: parentRunId } : {}),
+      metadata: codingAgentMetadata({
+        sessionId: input.session_id,
+        base: inherited,
+        turnNumber: turnNum,
+        runtimeVersion,
+        approvalPolicy,
+        agentType: "root",
+      }),
+    },
+    turnMode,
+  );
+
+  debug(`Created initial run ${runId} for turn ${turnNum}`);
+
+  await atomicUpdateState(config.stateFilePath, (s) => {
+    const ss = getSessionState(s, input.session_id);
+
+    // Preserve state for background subagents from prior turns that are still
+    // running (they outlive their turn's Stop hook). We keep their Agent tool run
+    // info in task_run_map so their traces still nest correctly, and keep their
+    // turns in open_turns so the last SubagentStop can complete them. But we drop
+    // the turn we just closed as interrupted above — it's already finalized, so a
+    // late SubagentStop should still trace the subagent but not re-complete it.
+    const inflightAgentIds = new Set(
+      Object.values(ss.open_turns ?? {}).flatMap((t) => t.agent_ids),
+    );
+    const preservedTaskRunMap = Object.fromEntries(
+      Object.entries(ss.task_run_map ?? {}).filter(([id]) => inflightAgentIds.has(id)),
+    );
+    const preservedOpenTurns = { ...ss.open_turns };
+    if (sessionState.current_turn_run_id) {
+      delete preservedOpenTurns[sessionState.current_turn_run_id];
+    }
+
+    return {
+      ...s,
+      [input.session_id]: {
+        ...ss,
+        current_turn_tracing: turnMode,
+        current_turn_run_id: runId,
+        current_trace_id: traceId,
+        current_dotted_order: dottedOrder,
+        current_parent_run_id: parentRunId,
+        current_turn_number: turnNum,
+        current_turn_start: startTime,
+        // If this is a task-notification turn, record the agent it's for so Stop
+        // closes that agent's tool run + launching turn once this turn completes.
+        current_notification_agent_id: notificationAgentId,
+        current_notification_interrupted: notificationInterrupted,
+        // Persisted so the closing hooks can stamp them onto their runs.
+        approval_policy: approvalPolicy,
+        ...(runtimeVersion ? { runtime_version: runtimeVersion } : {}),
+        last_line: Math.max(ss.last_line, interruptedLastLine),
+        turn_count: Math.max(ss.turn_count, countedTurns),
+        // Clear this turn's stale data, but keep still-running background subagents
+        // and any Agent tool runs left open awaiting their task-notification.
+        task_run_map: preservedTaskRunMap,
+        traced_tool_use_ids: [],
+        tool_start_times: {},
+        pending_subagent_traces: [],
+        open_turns: preservedOpenTurns,
+        notification_done_agents: ss.notification_done_agents,
+      },
+    };
+  });
+
+  const duration = ((Date.now() - hookStartTime) / 1000).toFixed(1);
+  debug(`UserPromptSubmit hook completed in ${duration}s`);
+}
+
+export async function closeInterruptedPrompt(
+  _id: string,
+  closing: QueuedClosing,
+  config: Config,
+): Promise<void> {
+  const input = closing.input as InterruptedClosingInput;
+  const sessionState = closing.session;
+  initTracing(config, input.cwd, input.session_id);
+  const transcriptPath = expandHome(input.transcript_path);
+  const runtimeVersion =
+    (transcriptPath ? readRuntimeVersion(transcriptPath) : undefined) ??
+    sessionState.runtime_version;
+  const supersededNotificationAgentId = sessionState.current_notification_agent_id;
+  try {
+    const { lastLine, turnsTraced, consumedToolUseIds } = await closeInterruptedTurn({
+      defaultMuted: config.defaultMuted,
+      sessionId: input.session_id,
+      sessionState,
+      transcriptPath,
+      stateFilePath: config.stateFilePath,
+      customMetadata: config.customMetadata,
+      runtimeVersion,
+      approvalPolicy: input.permission_mode,
+      error: input.error,
+      cutAtByte: closing.cut_bytes,
+    });
+    await atomicUpdateState(config.stateFilePath, (s) => {
+      const ss = getSessionState(s, input.session_id);
+      return {
+        ...s,
+        [input.session_id]: {
+          ...ss,
+          // Advance past the interrupted turn's messages so Stop doesn't re-trace them
+          last_line: Math.max(ss.last_line, lastLine),
+          ...advanceToolTracingProgress(ss, consumedToolUseIds ?? [], "transcript"),
+          turn_count: Math.max(ss.turn_count, sessionState.turn_count + turnsTraced),
+        },
+      };
+    });
+    if (supersededNotificationAgentId) {
+      await finalizeNotificationChain({
+        defaultMuted: config.defaultMuted,
+        stateFilePath: config.stateFilePath,
+        sessionId: input.session_id,
+        customMetadata: config.customMetadata,
+        runtimeVersion,
+        agentId: supersededNotificationAgentId,
+        // Carry the killed marker through this path too, in case the killed
+        // subagent's notification turn was itself superseded before its Stop.
+        interrupted: sessionState.current_notification_interrupted,
+      });
+    }
+  } catch (err) {
+    error(`Failed to close interrupted turn: ${err}`);
+  }
+}

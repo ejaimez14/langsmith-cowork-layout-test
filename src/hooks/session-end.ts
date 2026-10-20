@@ -1,0 +1,246 @@
+/**
+ * SessionEnd hook handler.
+ *
+ * Fires when a Claude Code session ends (user exits, /clear, /resume, etc.).
+ * If the session was interrupted (Stop never fired for the last turn), closes
+ * the open turn run so traces aren't left hanging in LangSmith.
+ *
+ * Note: default timeout is 1.5s. Set CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS
+ * to a higher value if needed.
+ */
+
+import { resolveTurnTracingMode } from "../tracing-mode.js";
+import { debug, error } from "../logger.js";
+import {
+  closeInterruptedTurn,
+  closeAgentToolRun,
+  completeTurnRun,
+  turnIdentityFromOpenTurn,
+} from "../langsmith.js";
+import { loadState, atomicUpdateState, getSessionState } from "../state.js";
+import { initHook, expandHome } from "../utils/hook-init.js";
+import { initTracing } from "../tracing-engine.js";
+import { queueClosing } from "../closing-queue.js";
+import { isPayloadForHook } from "../utils/harness.js";
+import { readStdin } from "../utils/stdin.js";
+import { readRuntimeVersion } from "../transcript.js";
+import type { Config, QueuedClosing, SessionEndHookInput, SessionState } from "../types.js";
+
+export async function main(): Promise<void> {
+  const input: SessionEndHookInput = await readStdin();
+  if (!isPayloadForHook(input, "SessionEnd")) return;
+
+  const config = initHook(input.cwd);
+  if (!config) return;
+
+  debug(`SessionEnd hook: session=${input.session_id}, reason=${input.reason}`);
+
+  const sessionState = getSessionState(loadState(config.stateFilePath), input.session_id);
+  if (hasOpenWork(sessionState)) {
+    await queueClosing(config, "session-end", input, { transcriptCut: true });
+    return;
+  }
+  debug("No open turn run — nothing to close");
+  await atomicUpdateState(config.stateFilePath, (s) => {
+    const ss = s[input.session_id];
+    if (!ss) return s;
+    return {
+      ...s,
+      [input.session_id]: { ...ss, tool_tracing_modes: {}, tool_tracing_progress: {} },
+    };
+  });
+}
+
+function hasOpenWork(sessionState: SessionState): boolean {
+  return Boolean(
+    Object.keys(sessionState.queued_closings ?? {}).length > 0 ||
+    sessionState.current_turn_run_id ||
+    Object.keys(sessionState.open_turns ?? {}).length > 0 ||
+    Object.values(sessionState.task_run_map ?? {}).some((e) => e.subagent_done),
+  );
+}
+
+export async function closeEndedSession(
+  _id: string,
+  closing: QueuedClosing,
+  config: Config,
+): Promise<void> {
+  const input = closing.input as SessionEndHookInput;
+  const ended = closing.session;
+  const live = getSessionState(loadState(config.stateFilePath), input.session_id);
+  const resumed = live.current_turn_run_id !== ended.current_turn_run_id;
+  const sessionState = {
+    ...live,
+    current_turn_run_id: resumed ? undefined : live.current_turn_run_id,
+    open_turns: onlyKnown(live.open_turns, ended.open_turns),
+    task_run_map: onlyKnown(live.task_run_map, ended.task_run_map),
+  };
+
+  const openTurns = sessionState.open_turns ?? {};
+  // Agent tool runs left open awaiting a task-notification that never arrived:
+  // task_run_map entries marked subagent_done (traced + posted) but not yet
+  // finalized (finalize deletes the entry).
+  const openAgentRuns = Object.entries(sessionState.task_run_map ?? {}).filter(
+    ([, e]) => e.subagent_done,
+  );
+
+  initTracing(config, input.cwd, input.session_id);
+
+  const expandedTranscript = expandHome(input.transcript_path);
+  const runtimeVersion =
+    sessionState.runtime_version ??
+    (expandedTranscript ? readRuntimeVersion(expandedTranscript) : undefined);
+
+  let lastLine = sessionState.last_line;
+  let turnsTraced = 0;
+
+  // Close the active turn if it was interrupted (Stop never fired for it).
+  if (sessionState.current_turn_run_id) {
+    debug(`Closing interrupted turn run ${sessionState.current_turn_run_id} on session end`);
+    try {
+      const res = await closeInterruptedTurn({
+        defaultMuted: config.defaultMuted,
+        sessionId: input.session_id,
+        sessionState,
+        transcriptPath: expandedTranscript,
+        stateFilePath: config.stateFilePath,
+        customMetadata: config.customMetadata,
+        runtimeVersion,
+        approvalPolicy: sessionState.approval_policy,
+        cutAtByte: closing.cut_bytes,
+      });
+      lastLine = res.lastLine;
+      turnsTraced = res.turnsTraced;
+    } catch (err) {
+      error(`Failed to close interrupted turn on session end: ${err}`);
+    }
+  }
+
+  // Close any Agent tool runs left open for async subagents whose task-notification
+  // turn never arrived (agent aborted / session ended first). Close these (children)
+  // before their launching turns (parents) below.
+  for (const [agentId, taskRunInfo] of openAgentRuns) {
+    const launchingTurnId = taskRunInfo.deferred?.parent_run_id as string | undefined;
+    const launchingTurn = launchingTurnId ? openTurns[launchingTurnId] : undefined;
+    try {
+      await closeAgentToolRun({
+        tracing: resolveTurnTracingMode(
+          config,
+          input.session_id,
+          taskRunInfo.tracing,
+          launchingTurn?.tracing,
+          launchingTurnId === sessionState.current_turn_run_id
+            ? sessionState.current_turn_tracing
+            : undefined,
+        ),
+        sessionId: input.session_id,
+        agentId,
+        agentType: taskRunInfo.agent_type ?? "",
+        taskRunInfo,
+        customMetadata: config.customMetadata,
+        runtimeVersion,
+        wasOpen: true, // subagent_done ⇒ SubagentStop posted it open
+      });
+      debug(`Closed open Agent tool run ${agentId} on session end`);
+    } catch (err) {
+      error(`Failed to close Agent tool run ${agentId} on session end: ${err}`);
+    }
+  }
+
+  // Close any deferred turns whose background subagents never finished before the
+  // session ended, so their root runs aren't left hanging in LangSmith.
+  //
+  // A deferred turn that has stop_seen=true already produced its main response
+  // (Stop ran and stashed last_assistant_message); only its background subagents
+  // were still running. Complete it with its real outputs — it succeeded, it is
+  // NOT an error. Only a turn whose Stop never fired (stop_seen=false, e.g. the
+  // turn was interrupted before completing) is closed with an error.
+  for (const [turnRunId, entry] of Object.entries(openTurns)) {
+    if (turnRunId === sessionState.current_turn_run_id) continue; // closed above
+    try {
+      if (entry.stop_seen) {
+        await completeTurnRun({
+          ...turnIdentityFromOpenTurn(entry, {
+            sessionId: input.session_id,
+            customMetadata: config.customMetadata,
+          }),
+          tracing: resolveTurnTracingMode(config, input.session_id, entry.tracing),
+          lastAssistantMessage: entry.last_assistant_message,
+        });
+        debug(`Completed deferred turn ${turnRunId} on session end`);
+      } else {
+        await closeInterruptedTurn({
+          defaultMuted: config.defaultMuted,
+          sessionId: input.session_id,
+          sessionState,
+          transcriptPath: expandedTranscript,
+          stateFilePath: config.stateFilePath,
+          customMetadata: config.customMetadata,
+          runtimeVersion,
+          turn: entry,
+          error: "Session ended before turn completed",
+        });
+        debug(`Closed interrupted deferred turn ${turnRunId} on session end`);
+      }
+    } catch (err) {
+      error(`Failed to close deferred turn ${turnRunId} on session end: ${err}`);
+    }
+  }
+
+  await atomicUpdateState(config.stateFilePath, (s) => {
+    const ss = getSessionState(s, input.session_id);
+    const counted = {
+      last_line: Math.max(ss.last_line, lastLine),
+      turn_count: ss.turn_count + turnsTraced,
+    };
+    if (resumed) {
+      return {
+        ...s,
+        [input.session_id]: {
+          ...ss,
+          ...counted,
+          task_run_map: withoutKeys(ss.task_run_map, sessionState.task_run_map),
+          open_turns: withoutKeys(ss.open_turns, sessionState.open_turns),
+        },
+      };
+    }
+    return {
+      ...s,
+      [input.session_id]: {
+        ...ss,
+        ...counted,
+        current_turn_tracing: undefined,
+        current_turn_run_id: undefined,
+        current_trace_id: undefined,
+        current_dotted_order: undefined,
+        current_parent_run_id: undefined,
+        task_run_map: {},
+        traced_tool_use_ids: [],
+        tool_start_times: {},
+        tool_tracing_modes: {},
+        tool_tracing_progress: {},
+        pending_subagent_traces: [],
+        open_turns: {},
+        current_notification_agent_id: undefined,
+        current_notification_interrupted: undefined,
+        notification_done_agents: [],
+      },
+    };
+  });
+
+  debug(`Session end cleanup complete (reason=${input.reason})`);
+}
+
+function onlyKnown<T>(
+  entries: Record<string, T> | undefined,
+  known: Record<string, unknown> | undefined,
+): Record<string, T> {
+  return Object.fromEntries(Object.entries(entries ?? {}).filter(([key]) => key in (known ?? {})));
+}
+
+function withoutKeys<T>(
+  entries: Record<string, T> | undefined,
+  removed: Record<string, unknown>,
+): Record<string, T> {
+  return Object.fromEntries(Object.entries(entries ?? {}).filter(([key]) => !(key in removed)));
+}

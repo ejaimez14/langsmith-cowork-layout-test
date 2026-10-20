@@ -1,0 +1,199 @@
+// A workflow stage nests under its Workflow run and a synchronous subagent waits for Stop, while a
+// background subagent goes to the uploader and stays open until its notification turn closes it.
+
+import { resolveTurnTracingMode } from "../tracing-mode.js";
+import { debug, error } from "../logger.js";
+import { atomicUpdateState, getSessionState, loadState } from "../state.js";
+import { tracePendingSubagents } from "../langsmith.js";
+import { finalizeNotificationChain } from "../finalize.js";
+import { WORKFLOW_SUBAGENT_TYPE } from "../constants.js";
+import { handleWorkflowSubagentStop } from "../workflows.js";
+import { initTracing } from "../tracing-engine.js";
+import { initHook, expandHome } from "../utils/hook-init.js";
+import { isPayloadForHook } from "../utils/harness.js";
+import { readStdin } from "../utils/stdin.js";
+import { queueClosing } from "../closing-queue.js";
+import type { Config, OpenTurn, QueuedClosing, SubagentStopHookInput } from "../types.js";
+
+export async function main(): Promise<void> {
+  const input: SubagentStopHookInput = await readStdin();
+  if (!isPayloadForHook(input, "SubagentStop")) return;
+
+  const config = initHook(input.cwd);
+  if (!config) return;
+
+  debug(`SubagentStop hook: agent_id=${input.agent_id}, type=${input.agent_type}`);
+
+  const agentTranscriptPath = expandHome(input.agent_transcript_path);
+  if (!agentTranscriptPath) {
+    debug("No agent_transcript_path provided, skipping");
+    return;
+  }
+
+  if (input.agent_type === WORKFLOW_SUBAGENT_TYPE) {
+    await queueClosing(config, "subagent-stop", input);
+    return;
+  }
+
+  const sessionState = getSessionState(loadState(config.stateFilePath), input.session_id);
+  const taskRunMap = sessionState.task_run_map ?? {};
+  const taskRunInfo = taskRunMap[input.agent_id];
+
+  // Case 1: synchronous subagent — PostToolUse hasn't recorded the Agent tool
+  // run yet. Queue for the Stop hook (which runs after PostToolUse).
+  if (!taskRunInfo) {
+    await atomicUpdateState(config.stateFilePath, (s) => {
+      const ss = getSessionState(s, input.session_id);
+      return {
+        ...s,
+        [input.session_id]: {
+          ...ss,
+          pending_subagent_traces: [
+            ...(ss.pending_subagent_traces || []),
+            {
+              agent_id: input.agent_id,
+              agent_type: input.agent_type,
+              agent_transcript_path: agentTranscriptPath,
+              session_id: input.session_id,
+            },
+          ],
+        },
+      };
+    });
+    debug(`Queued subagent ${input.agent_id} for Stop hook (Agent tool run not recorded yet)`);
+    return;
+  }
+
+  await queueClosing(config, "subagent-stop", input);
+}
+
+export async function traceStoppedSubagent(
+  _id: string,
+  closing: QueuedClosing,
+  config: Config,
+): Promise<void> {
+  const input = closing.input as SubagentStopHookInput;
+  const agentTranscriptPath = expandHome(input.agent_transcript_path)!;
+
+  initTracing(config, input.cwd, input.session_id);
+
+  // Dynamic-workflow stage: not launched via the Task tool (so it's absent from
+  // task_run_map), it nests under its open Workflow run instead. Handled
+  // separately; the workflow's own task-notification finalizes the run.
+  if (input.agent_type === WORKFLOW_SUBAGENT_TYPE) {
+    await handleWorkflowSubagentStop({
+      defaultMuted: config.defaultMuted,
+      sessionId: input.session_id,
+      agentId: input.agent_id,
+      agentType: input.agent_type,
+      agentTranscriptPath,
+      stateFilePath: config.stateFilePath,
+      customMetadata: config.customMetadata,
+    });
+    return;
+  }
+
+  const sessionState = getSessionState(loadState(config.stateFilePath), input.session_id);
+  const taskRunMap = sessionState.task_run_map ?? {};
+  const taskRunInfo = taskRunMap[input.agent_id];
+  if (!taskRunInfo) return;
+
+  // Case 2: async (background) subagent. Recover the launching turn's trace
+  // context from the deferred Agent tool run so the subagent nests under the
+  // correct turn even if a newer turn is now active.
+  const deferred = taskRunInfo.deferred as Record<string, unknown> | undefined;
+  const turnRunId =
+    (deferred?.parent_run_id as string | undefined) ?? sessionState.current_turn_run_id;
+  const turnTraceId = (deferred?.trace_id as string | undefined) ?? sessionState.current_trace_id;
+  const launchingTurn: OpenTurn | undefined = turnRunId
+    ? sessionState.open_turns?.[turnRunId]
+    : undefined;
+
+  if (!turnTraceId) {
+    debug(`No trace context for subagent ${input.agent_id}, cannot trace`);
+    return;
+  }
+
+  try {
+    await tracePendingSubagents({
+      tracing: resolveTurnTracingMode(
+        config,
+        input.session_id,
+        taskRunInfo.tracing,
+        launchingTurn?.tracing,
+        turnRunId === sessionState.current_turn_run_id
+          ? sessionState.current_turn_tracing
+          : undefined,
+      ),
+      sessionId: input.session_id,
+      pendingSubagents: [
+        {
+          agent_id: input.agent_id,
+          agent_type: input.agent_type,
+          agent_transcript_path: agentTranscriptPath,
+          session_id: input.session_id,
+        },
+      ],
+      taskRunMap,
+      parentTraceId: turnTraceId,
+      customMetadata: config.customMetadata,
+      runtimeVersion: launchingTurn?.runtime_version ?? sessionState.runtime_version,
+      turnId: launchingTurn?.turn_id,
+      turnNumber: launchingTurn?.turn_number ?? sessionState.current_turn_number,
+      // Leave the Agent tool run open — the task-notification turn nests under it.
+      keepAgentToolRunOpen: true,
+    });
+    debug(`Traced background subagent ${input.agent_type} (${input.agent_id})`);
+  } catch (err) {
+    error(`Failed to trace background subagent: ${err}`);
+  }
+
+  // Mark the subagent done on its task_run_map entry, then join with the
+  // notification side. The notification turn and this SubagentStop fire in
+  // non-deterministic order; the agent's tool run + launching turn are closed by
+  // whichever runs LAST. We mark `subagent_done` regardless of whether the trace
+  // succeeded (empty/aborted transcript still leaves an Agent tool run posted), so
+  // the launching turn is always drained and never stranded. If the notification
+  // turn already completed (notification_done_agents has us), we're last → finalize;
+  // otherwise leave it for the notification turn's Stop to finalize.
+  let finalizeNow = false;
+  await atomicUpdateState(config.stateFilePath, (s) => {
+    const ss = getSessionState(s, input.session_id);
+    const entry = ss.task_run_map?.[input.agent_id];
+    const notifDone = (ss.notification_done_agents ?? []).includes(input.agent_id);
+    if (notifDone) finalizeNow = true;
+    return {
+      ...s,
+      [input.session_id]: {
+        ...ss,
+        task_run_map: entry
+          ? {
+              ...ss.task_run_map,
+              [input.agent_id]: {
+                ...entry,
+                agent_type: input.agent_type || entry.agent_type,
+                subagent_done: true,
+              },
+            }
+          : ss.task_run_map,
+        notification_done_agents: notifDone
+          ? (ss.notification_done_agents ?? []).filter((id) => id !== input.agent_id)
+          : ss.notification_done_agents,
+      },
+    };
+  });
+
+  if (finalizeNow) {
+    debug(`Notification already done for ${input.agent_id}; finalizing from SubagentStop`);
+    await finalizeNotificationChain({
+      defaultMuted: config.defaultMuted,
+      stateFilePath: config.stateFilePath,
+      sessionId: input.session_id,
+      customMetadata: config.customMetadata,
+      runtimeVersion: launchingTurn?.runtime_version ?? sessionState.runtime_version,
+      agentId: input.agent_id,
+    });
+  } else {
+    debug(`Subagent ${input.agent_id} traced; awaiting task-notification to finalize`);
+  }
+}

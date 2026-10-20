@@ -1,0 +1,24 @@
+{
+  "name": "langsmith-claude-code-plugins",
+  "owner": {
+    "name": "LangChain",
+    "email": "support@langchain.dev"
+  },
+  "metadata": {
+    "description": "Trace Claude Code conversations, tool calls, subagent executions, and context compaction to LangSmith"
+  },
+  "plugins": [
+    {
+      "name": "langsmith-tracing",
+      "description": "Traces Claude Code sessions to LangSmith with full observability: LLM calls, tool executions, subagent runs, and context compaction events",
+      "source": "./plugins/langsmith-tracing",
+      "homepage": "https://github.com/langchain-ai/langsmith-claude-code-plugins"
+    },
+    {
+      "name": "langsmith-gateway",
+      "description": "Experimental opt-in local subscription gateway proxy, managed through Claude Code setup/disable commands and independent of tracing.",
+      "source": "./plugins/langsmith-gateway",
+      "homepage": "https://github.com/langchain-ai/langsmith-claude-code-plugins"
+    }
+  ]
+}

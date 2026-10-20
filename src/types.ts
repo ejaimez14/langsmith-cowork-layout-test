@@ -1,0 +1,640 @@
+/**
+ * Types for Claude Code hook inputs and JSONL transcript messages.
+ */
+
+import type { RunTree, RunTreeConfig } from "langsmith";
+import type { StringNodeRule } from "langsmith/anonymizer";
+import type {
+  CodingAgentAgentType,
+  CodingAgentMetadataOptions,
+} from "@langchain/plugins-base/metadata";
+import type { PluginSession } from "@langchain/plugins-base/plugin";
+import type { LifecycleCaptureInput } from "@langchain/plugins-base/tracing/lifecycle";
+import type { RecordedRun, TurnRecord } from "@langchain/plugins-base/tracing/settlement";
+import type { BOOLEAN_SETTINGS, HOOK_EVENT_NAMES, PINNED_REPOSITORY_KEYS } from "./constants.js";
+
+export type TracingMode = "full" | "metadata";
+
+export type HookEventName = (typeof HOOK_EVENT_NAMES)[number];
+
+export interface TracingPolicy {
+  threads: Record<string, TracingMode>;
+}
+
+// ─── Hook Input Types ───────────────────────────────────────────────────────
+
+/** The one field the harness check reads, since every other field varies by event and by harness. */
+export interface HookEventPayload {
+  hook_event_name?: string;
+}
+
+/** Common fields present in all hook inputs (delivered via stdin JSON). */
+interface HookInputBase {
+  session_id: string;
+  transcript_path: string;
+  cwd: string;
+  permission_mode?: string;
+  hook_event_name: string;
+  agent_id?: string;
+  agent_type?: string;
+}
+
+/** Input for the Stop hook. */
+export interface StopHookInput extends HookInputBase {
+  hook_event_name: "Stop";
+  stop_hook_active: boolean;
+  last_assistant_message: string;
+}
+
+/** Input for the SubagentStop hook. */
+export interface SubagentStopHookInput extends HookInputBase {
+  hook_event_name: "SubagentStop";
+  stop_hook_active: boolean;
+  agent_id: string;
+  agent_type: string;
+  agent_transcript_path: string;
+  last_assistant_message: string;
+}
+
+// ─── Transcript Message Types ───────────────────────────────────────────────
+
+/** A text content block in an assistant message. */
+export interface TextBlock {
+  type: "text";
+  text: string;
+}
+
+/** A thinking content block in an assistant message. */
+export interface ThinkingBlock {
+  type: "thinking";
+  thinking: string;
+}
+
+/** A tool_use content block in an assistant message. */
+export interface ToolUseBlock {
+  type: "tool_use";
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+/** A tool_result content block in a tool result message. */
+export interface ToolResultBlock {
+  type: "tool_result";
+  tool_use_id: string;
+  content: string | Array<{ type: "text"; text: string }>;
+}
+
+export type ContentBlock = TextBlock | ThinkingBlock | ToolUseBlock;
+
+/** Token usage data from an assistant message. */
+export interface Usage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  service_tier?: string | null;
+}
+
+/** A user message (human input) in the transcript. */
+export interface UserMessage {
+  type: "user";
+  message: {
+    role: "user";
+    content: string;
+  };
+  timestamp: string;
+  promptId?: string;
+}
+
+/** A tool result message in the transcript (also role: "user"). */
+export interface ToolResultMessage {
+  type: "user";
+  message: {
+    role: "user";
+    content: ToolResultBlock[];
+  };
+  timestamp: string;
+  promptId?: string;
+  /** Present on Task tool results — links to subagent transcript. */
+  toolUseResult?: {
+    agentId: string;
+  };
+}
+
+/** An assistant message in the transcript. */
+export interface AssistantMessage {
+  type: "assistant";
+  message: {
+    id: string;
+    role: "assistant";
+    model: string;
+    content: ContentBlock[];
+    usage: Usage;
+    stop_reason?: string | null;
+  };
+  timestamp: string;
+  promptId?: string;
+  effort?: string;
+}
+
+export type TranscriptMessage = UserMessage | ToolResultMessage | AssistantMessage;
+
+// ─── Parsed Turn (grouped messages) ────────────────────────────────────────
+
+/** A tool invocation paired with its result. */
+export interface ToolCall {
+  tool_use: ToolUseBlock;
+  result?: {
+    content: string;
+    timestamp: string;
+  };
+  /** If this was a Task tool, the agent ID for subagent tracing. */
+  agentId?: string;
+}
+
+/** A single LLM response, possibly with tool calls. */
+export interface LLMCall {
+  /** Merged content from all streaming chunks. */
+  content: ContentBlock[];
+  /** Model name (date suffix stripped). */
+  model: string;
+  /** Final cumulative usage. */
+  usage: Usage;
+  /** Timestamp of first chunk (start time). */
+  startTime: string;
+  /** Timestamp of last chunk (end time). */
+  endTime: string;
+  /** Reasoning effort the call ran at, when the transcript records one. */
+  effort?: string;
+  /** Tool calls made in this response. */
+  toolCalls: ToolCall[];
+  /** True if this LLM call was synthesized (not from the transcript). */
+  synthetic?: boolean;
+}
+
+/** A complete turn: one user prompt → one or more LLM calls. */
+export interface Turn {
+  userContent: string | Array<Record<string, unknown>>;
+  userTimestamp: string;
+  llmCalls: LLMCall[];
+  /** Whether the turn is complete (has stop_reason: "end_turn"). If false, the assistant is still responding. */
+  isComplete: boolean;
+  /** Claude Code prompt id for this turn → coding-agent-v1 `turn_id`. */
+  promptId?: string;
+}
+
+// ─── Repository Attribution ────────────────────────────────────────────────
+
+export interface ToolPathLookup {
+  path?: string;
+  namedAPath: boolean;
+}
+
+export interface ToolOrigin extends ToolPathLookup {
+  cwd?: string;
+}
+
+export type ClaudeMetadataOptions = Omit<
+  CodingAgentMetadataOptions,
+  "integration" | "integrationVersion" | "threadId" | "runType"
+> & { sessionId: string };
+
+export interface ClaudeRun {
+  id: string;
+  name: string;
+  run_type: string;
+  start_time: string | number;
+  end_time?: string | number;
+  inputs?: Record<string, unknown>;
+  outputs?: Record<string, unknown>;
+  error?: string;
+  parent_run_id?: string;
+  trace_id: string;
+  dotted_order: string;
+  metadata: CodingAgentMetadataOptions;
+}
+
+export type RunOperation = "post" | "patch";
+
+export type CaptureDependency = NonNullable<LifecycleCaptureInput["dependencies"]>[number];
+
+export interface ClaudeTracingSession extends PluginSession {
+  destinations: readonly { id: string }[];
+}
+
+export interface EngineRunPayload {
+  privacyMode: TracingMode;
+  run: Record<string, string>;
+}
+
+export interface EngineTurnRecord {
+  record: TurnRecord;
+  landed: boolean;
+}
+
+export interface TurnEvidenceChildren {
+  childRunIds?: string[];
+}
+
+export interface MetadataWithPins {
+  [PINNED_REPOSITORY_KEYS]?: ReadonlySet<string>;
+}
+
+// ─── Tracing State ─────────────────────────────────────────────────────────
+
+export interface SessionState {
+  /** Captured once at UserPromptSubmit; preference changes apply to the next turn. */
+  current_turn_tracing?: TracingMode;
+  /** Tools inherit their launching turn's mode, but async PostToolUse can run after
+   *  a newer turn starts. Reading current_turn_tracing then could upload a muted
+   *  tool's content after unmute. Keep a per-tool privacy snapshot across turn resets
+   *  because the hook does not reliably identify its original turn. This does not
+   *  select parents or change trace ownership/nesting. Reclaim it once PostToolUse
+   *  and transcript processing have both consumed it (or at SessionEnd). */
+  tool_tracing_modes?: Record<string, TracingMode>;
+  /** First side of the privacy-snapshot cleanup join; removed when both sides finish.
+   *  Independent of turn-local dedup IDs (Agent PostToolUse doesn't record those). */
+  tool_tracing_progress?: Record<string, "post" | "transcript">;
+  /** Captured by PreCompact for async PostCompact (manual preference or auto turn mode). */
+  compaction_tracing?: TracingMode;
+  last_line: number;
+  turn_count: number;
+  updated: string;
+  /** Current turn's run ID, set by UserPromptSubmit hook */
+  current_turn_run_id?: string;
+  /** Current turn's trace ID */
+  current_trace_id?: string;
+  /** Current turn's dotted order prefix for child runs */
+  current_dotted_order?: string;
+  /** Current turn's parent run ID (set when nesting under an external parent) */
+  current_parent_run_id?: string;
+  /** Current turn number (1-based), set by UserPromptSubmit for Stop to use */
+  current_turn_number?: number;
+  /** Current turn start time (ISO string) for duration calculation */
+  current_turn_start?: string;
+  /** Permission mode for the current turn → coding-agent-v1 `approval_policy` (root/interrupted). */
+  approval_policy?: string;
+  /** Claude Code CLI version → coding-agent-v1 `ls_agent_runtime_version`. */
+  runtime_version?: string;
+  /** Wall-clock time (ms) when the last tool finished, set by PostToolUse */
+  last_tool_end_time?: number;
+  /** Maps tool_use_id -> wall-clock start time (ms), set by PreToolUse */
+  tool_start_times?: Record<string, number>;
+  /** Maps agent_id -> parent tool run info for linking subagent traces.
+   *  For Agent tools, also stores deferred creation info so the Stop hook
+   *  can create the run with the correct subagent name. */
+  task_run_map?: Record<
+    string,
+    {
+      tracing?: TracingMode;
+      run_id: string;
+      dotted_order: string;
+      /** Deferred Agent tool creation info (set by PostToolUse, used by Stop) */
+      deferred?: Partial<RunTree>;
+      /** Subagent type (e.g. "Explore"), recorded by SubagentStop. Used when
+       *  closing the Agent tool run. */
+      agent_type?: string;
+      /** True once SubagentStop has processed this (async) subagent and posted its
+       *  Agent tool run. The notification side of the join reads this to know the
+       *  subagent finished (replaces the former separate `open_agent_runs` map).
+       *  For Workflow runs this is set true at launch — the run is posted open by
+       *  PostToolUse, so finalize patches it closed (there's no per-workflow
+       *  SubagentStop; the workflow's task-notification is the completion signal). */
+      subagent_done?: boolean;
+      /** For dynamic Workflow tool runs: the workflow run_id (`wf_…`). Its stage
+       *  agents surface as `workflow-subagent` SubagentStops carrying this id in
+       *  their transcript path, so they can be correlated back to this run. This
+       *  entry itself is keyed by the workflow's taskId (what its completion
+       *  task-notification references). */
+      workflow_run_id?: string;
+      /** True when this entry is a Workflow tool run (posted open at launch) rather
+       *  than a deferred Task Agent run — names the run "Workflow" on close. */
+      is_workflow?: boolean;
+    }
+  >;
+  /** tool_use_ids of regular tools already traced by PostToolUse (prevents double-tracing in traceTurn) */
+  traced_tool_use_ids?: string[];
+  /** Wall-clock time (ms) when the last PreCompact hook fired */
+  compaction_start_time?: number;
+  /** Pending subagent traces to process (set by SubagentStop, processed by Stop).
+   *  Only used for synchronous subagents, whose SubagentStop fires before
+   *  PostToolUse has recorded the Agent tool run. */
+  pending_subagent_traces?: Array<{
+    agent_id: string;
+    agent_type: string;
+    agent_transcript_path: string;
+    session_id: string;
+  }>;
+  /** Turns that launched background subagents which may outlive the Stop hook,
+   *  keyed by turn run_id. Background subagents run concurrently with the main
+   *  loop, so a later turn can start (and launch its own subagents) before an
+   *  earlier turn's subagents finish — hence a map, not a single value. The last
+   *  SubagentStop to drain a turn's `agent_ids` completes that turn's root run. */
+  open_turns?: Record<string, OpenTurn>;
+  /** When the current turn is a task-notification turn, the agent_id it is for.
+   *  Set by UserPromptSubmit (it nests the turn under that agent's tool run), read
+   *  by Stop to close the agent tool run + drain its launching turn on completion. */
+  current_notification_agent_id?: string;
+  /** True when the current turn's task-notification reported a non-"completed"
+   *  status (e.g. "killed") — the subagent was cancelled, so SubagentStop never
+   *  fires. Tells Stop to finalize immediately (don't wait on the join) and mark
+   *  the agent's tool run interrupted. */
+  current_notification_interrupted?: boolean;
+  /** agent_ids whose task-notification turn has completed but whose SubagentStop
+   *  hasn't traced the subagent yet (the two fire in non-deterministic order when
+   *  a background agent finishes while the main agent is idle). Whichever of the
+   *  two runs *last* finalizes the agent; this is the notification side's "done"
+   *  marker for that join. */
+  notification_done_agents?: string[];
+  managed_notice_shown?: boolean;
+  queued_closings?: Record<string, QueuedClosing>;
+}
+
+export type ClosingKind =
+  | "stop"
+  | "stop-failure"
+  | "session-end"
+  | "interrupted"
+  | "subagent-stop"
+  | "post-compact";
+
+export type InterruptedClosingInput = Omit<UserPromptSubmitHookInput, "prompt"> & {
+  error: string;
+};
+
+export type ClosingInput =
+  | StopHookInput
+  | StopFailureHookInput
+  | SessionEndHookInput
+  | InterruptedClosingInput
+  | SubagentStopHookInput
+  | PostCompactHookInput;
+
+export interface QueuedClosing {
+  kind: ClosingKind;
+  at: number;
+  cut_bytes?: number;
+  input: ClosingInput;
+  session: SessionState;
+}
+
+export interface ClosingOptions {
+  reset?: (session: SessionState) => Partial<SessionState>;
+  skip?: (session: SessionState) => boolean;
+  transcriptCut?: boolean;
+}
+
+export type ClosingHandler = (id: string, closing: QueuedClosing, config: Config) => Promise<void>;
+
+/**
+ * Completion context for a turn whose background subagents are still in flight.
+ * Holds everything needed to complete (patch) the turn's root run independently
+ * of the session's "current turn", since later turns overwrite the `current_*`
+ * fields while this turn's subagents are still running.
+ */
+export interface OpenTurn {
+  tracing?: TracingMode;
+  run_id: string;
+  trace_id?: string;
+  dotted_order?: string;
+  parent_run_id?: string;
+  start_time?: string;
+  turn_number?: number;
+  turn_id?: string;
+  runtime_version?: string;
+  approval_policy?: string;
+  /** Final assistant message → root run outputs; set by Stop when the main turn ends. */
+  last_assistant_message?: string;
+  /** True once the Stop hook finished the main turn. Gates completion: a subagent
+   *  that finishes before Stop must not complete the turn prematurely. */
+  stop_seen: boolean;
+  /** Background subagents launched by this turn that haven't been traced yet. */
+  agent_ids: string[];
+  /** Set when this turn is itself a deferred task-notification turn: the agent_id
+   *  whose tool run + launching turn must be finalized once this turn completes
+   *  (handles a notification turn that spawns its own background subagent). */
+  notification_for_agent_id?: string;
+}
+
+export interface TracingState {
+  [sessionId: string]: SessionState;
+}
+
+/** Trace context of the turn that launched a background run. */
+export interface LaunchingTurn {
+  tracing?: TracingMode;
+  run_id: string;
+  trace_id?: string;
+  dotted_order?: string;
+  parent_run_id?: string;
+  start_time?: string;
+  turn_number?: number;
+  runtime_version?: string;
+  approval_policy?: string;
+}
+
+/** Assistant and tool runs are siblings under the turn run. */
+export interface TraceTurnOptions {
+  tracing?: TracingMode;
+  toolTracingModes?: Record<string, TracingMode>;
+  turn: Turn;
+  sessionId: string;
+  turnNum: number;
+  parentRunId?: string;
+  existingTaskRunMap?: Record<string, TaskRunEntry>;
+  /** Already traced by PostToolUse, so skipped. */
+  tracedToolUseIds?: Set<string>;
+  traceId?: string;
+  parentDottedOrder?: string;
+  customMetadata?: Record<string, unknown>;
+  /** Sent as `ls_agent_runtime_version`. */
+  runtimeVersion?: string;
+  /** Sent as `approval_policy` on the turn run only. */
+  approvalPolicy?: string;
+  agentType?: CodingAgentAgentType;
+  rootRunId?: string;
+  hookCwd?: string;
+}
+
+/** What it takes to close a turn run. */
+export interface TurnRunIdentity {
+  tracing?: TracingMode;
+  sessionId: string;
+  runId: string;
+  traceId?: string;
+  dottedOrder?: string;
+  parentRunId?: string;
+  startTime?: string;
+  turnId?: string;
+  turnNumber?: number;
+  runtimeVersion?: string;
+  approvalPolicy?: string;
+  customMetadata?: Record<string, unknown>;
+}
+
+export interface PendingSubagent {
+  agent_id: string;
+  agent_type: string;
+  agent_transcript_path: string;
+  session_id: string;
+}
+
+export interface TaskRunEntry {
+  tracing?: TracingMode;
+  run_id: string;
+  dotted_order: string;
+  deferred?: Record<string, unknown>;
+  /** Set by SubagentStop to close the Agent run. */
+  agent_type?: string;
+  /** Set once SubagentStop has handled this background subagent. */
+  subagent_done?: boolean;
+  /** Matches workflow stage SubagentStops, which carry it in their path. */
+  workflow_run_id?: string;
+  is_workflow?: boolean;
+}
+
+export interface PreToolUseHookInput {
+  session_id: string;
+  cwd: string;
+  hook_event_name: "PreToolUse";
+  tool_use_id: string;
+  tool_name: string;
+}
+
+export interface PreCompactHookInput {
+  session_id: string;
+  transcript_path: string;
+  cwd: string;
+  hook_event_name: "PreCompact";
+  trigger: "manual" | "auto";
+  custom_instructions: string;
+}
+
+export interface StopFailureHookInput {
+  session_id: string;
+  transcript_path: string;
+  cwd: string;
+  hook_event_name: "StopFailure";
+  error: string;
+  error_details?: string;
+  last_assistant_message?: string;
+}
+
+export interface PostCompactHookInput {
+  session_id: string;
+  transcript_path: string;
+  cwd: string;
+  hook_event_name: "PostCompact";
+  trigger: "manual" | "auto";
+  compact_summary: string;
+}
+
+export interface PostToolUseHookInput {
+  session_id: string;
+  transcript_path: string;
+  cwd: string;
+  permission_mode?: string;
+  hook_event_name: "PostToolUse";
+  tool_name: string;
+  tool_input: Record<string, unknown>;
+  tool_response: Record<string, unknown>;
+  tool_use_id: string;
+  agent_id?: string;
+  agent_type?: string;
+}
+
+export interface SessionEndHookInput {
+  session_id: string;
+  transcript_path: string;
+  cwd: string;
+  hook_event_name: "SessionEnd";
+  reason: string;
+}
+
+export interface WorkflowLaunch {
+  /** The completion notification refers to it. */
+  taskId: string;
+  /** Appears in each stage's transcript path. */
+  runId: string;
+  workflowName?: string;
+}
+
+export interface UserPromptSubmitHookInput {
+  session_id: string;
+  transcript_path: string;
+  cwd: string;
+  permission_mode?: string;
+  hook_event_name: "UserPromptSubmit";
+  prompt: string;
+  agent_id?: string;
+  agent_type?: string;
+}
+
+export interface Config {
+  /** Resolved from env, then project config, then user config. */
+  enabled: boolean;
+  /** For threads with no preference of their own. */
+  defaultMuted: boolean;
+  apiKey: string;
+  project: string;
+  apiBaseUrl: string;
+  stateFilePath: string;
+  debug: boolean;
+  /** Existing run to nest every trace under. */
+  parentDottedOrder?: string;
+  replicas?: RunTreeConfig["replicas"];
+  /** Added to every run, including repo info and CC_LANGSMITH_METADATA. */
+  customMetadata?: Record<string, unknown>;
+  redact: boolean;
+  /** From CC_LANGSMITH_REDACT_EXTRA or the config file. */
+  redactExtraRules?: StringNodeRule[];
+  managedConfigProblem?: string;
+}
+
+export type BooleanSetting = keyof typeof BOOLEAN_SETTINGS;
+
+export interface LegacyQueueEntry {
+  tracing: TracingMode;
+  origin: string;
+  run: Omit<ClaudeRun, "metadata"> & { extra?: { metadata?: Record<string, unknown> } };
+  where?: ToolOrigin;
+}
+
+export interface LegacyRun {
+  sessionId: string;
+  file: string;
+  mode: TracingMode;
+  operation: RunOperation;
+  run: ClaudeRun;
+}
+
+export type LegacyFile = [sessionId: string, file: string];
+
+export interface LegacyScan {
+  runs: LegacyRun[];
+  settled: string[];
+  unreadable: string[];
+}
+
+export interface LegacyTurnLine {
+  k: string;
+  root?: boolean;
+  origin?: string;
+  id: string;
+  run?: RecordedRun;
+}
+
+export interface LegacyRunMetadata {
+  thread_id?: string;
+  ls_agent_type?: CodingAgentAgentType;
+  turn_id?: string;
+  turn_number?: number;
+  ls_agent_runtime_version?: string;
+  ls_integration_version?: string;
+  ls_subagent_id?: string;
+  ls_subagent_type?: string;
+  ls_skill_name?: string;
+  ls_model_name?: string;
+  usage_metadata?: Record<string, unknown>;
+}

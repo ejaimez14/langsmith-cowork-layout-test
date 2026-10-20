@@ -1,0 +1,49 @@
+{
+  "name": "@langchain/langsmith-claude-code-plugins",
+  "version": "0.5.3",
+  "description": "Claude Code plugin for LangSmith tracing",
+  "type": "module",
+  "scripts": {
+    "build": "tsc && pnpm bundle",
+    "build:binary": "langsmith-plugin-binary build",
+    "sign:binary": "langsmith-plugin-binary sign",
+    "bundle": "node esbuild.config.mjs",
+    "dev": "tsc --watch",
+    "format": "oxfmt --write",
+    "test": "vitest run",
+    "test:binary": "vitest run src/hooks/dispatch.binary.test.ts",
+    "test:hooks": "vitest run src/hook-command.test.ts",
+    "test:paths": "vitest run src/repo-attribution.test.ts",
+    "test:picker": "vitest run src/binary-picker.test.ts",
+    "test:watch": "vitest",
+    "tsx": "tsx",
+    "lint": "pnpm lint:code",
+    "lint:code": "oxlint",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "lint:fix": "oxlint --fix",
+    "clean": "rm -rf dist bin"
+  },
+  "dependencies": {
+    "langsmith": "^0.10.11"
+  },
+  "devDependencies": {
+    "@langchain/plugins-base": "0.4.5",
+    "@types/node": "^26.6.5",
+    "esbuild": "^0.28.1",
+    "oxfmt": "^0.72.0",
+    "oxlint": "^1.87.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vite": "8.3.4",
+    "vitest": "^5.0.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "packageManager": "pnpm@10.33.0+sha512.10568bb4a6afb58c9eb3630da90cc9516417abebd3fabbe6739f0ae795728da1491e9db5a544c76ad8eb7570f5c4bb3d6c637b2cb41bfdcdb47fa823c8649319",
+  "pnpm": {
+    "overrides": {
+      "esbuild": "0.28.1"
+    }
+  }
+}
